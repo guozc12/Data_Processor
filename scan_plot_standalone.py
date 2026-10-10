@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QDialog, QFileDialog, QApplication,
     QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QWidget,
-    QSplitter, QCheckBox, QFrame, QSizePolicy, QTabWidget,
+    QSplitter, QCheckBox, QFrame, QSizePolicy,
     QToolButton, QMenu, QInputDialog, QMessageBox, QRadioButton,
     QButtonGroup, QLineEdit, QDockWidget, QToolBar, QScrollArea,
     QGroupBox, QDoubleSpinBox,
@@ -41,7 +41,6 @@ from pyqtgraph import (
 import numpy as np
 from scipy.stats import sem
 from statsmodels.stats.proportion import proportion_confint
-from scipy.cluster.hierarchy import fcluster, linkage
 
 import logging
 import io
@@ -61,9 +60,6 @@ from types import SimpleNamespace
 
 import win32clipboard
 from PIL import Image
-
-# from artiq.applets.simple import SimpleApplet
-# from sipyco.pc_rpc import Client
 
 ROOT = Path(__file__).resolve().parent
 FOLDER = ROOT / "data"
@@ -287,7 +283,7 @@ class ScanDataset:
 @dataclass
 class PlotViewState:
     title: str
-    kind: str  # curves|export|2d|heatmap|batch|derived_merge|derived_global
+    kind: str  # curves|export|2d|heatmap|batch|derived_fit|derived_avg
     style: dict = field(default_factory=default_plot_style)
     show_legend: bool = True
     show_errorbars: bool = True
@@ -1046,17 +1042,7 @@ class AnalyzePanel(QWidget):
         row.addWidget(self.bt_fit)
         row.addWidget(self.bt_clear)
         root.addLayout(row)
-        # Alias kept for older wiring; Derive lives in DerivePanel
-        self.bt_derive = QPushButton("Derive…")
-        self.bt_derive.hide()
         root.addWidget(self._hline())
-        # Legacy analyze entry points kept for recipe replay / aliases; hidden from UI
-        self.bt_2d = QPushButton("2D")
-        self.bt_batch = QPushButton("Batch fit")
-        self.bt_roi_grid = QPushButton("ROI grid")
-        self.bt_2d.hide()
-        self.bt_batch.hide()
-        self.bt_roi_grid.hide()
         self.bt_export = QPushButton("Export")
         root.addWidget(self.bt_export)
         root.addWidget(self._hline())
@@ -1398,42 +1384,6 @@ class Plots:
         
 
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QHBoxLayout
-class ParameterDialog(QDialog):
-    def __init__(self, fit_options, x_options, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Plot Fit Parameter")
-        self.setModal(True)
-        
-        main_layout = QVBoxLayout()
-        
-        dropdown_layout = QHBoxLayout()
-        dropdown_layout.addWidget(QLabel("Fit parameter:"))
-        self.cob_fit = QComboBox()
-        self.cob_fit.addItems(fit_options)
-        dropdown_layout.addWidget(self.cob_fit)
-        
-        dropdown_layout.addWidget(QLabel("X:"))
-        self.x_combo = QComboBox()
-        self.x_combo.addItems(x_options)
-        dropdown_layout.addWidget(self.x_combo)
-        
-        main_layout.addLayout(dropdown_layout)
-        
-        button_layout = QHBoxLayout()
-        self.ok_button = QPushButton("OK")
-        self.ok_button.clicked.connect(self.accept)
-        button_layout.addWidget(self.ok_button)
-        
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_button)
-        
-        main_layout.addLayout(button_layout)
-        
-        self.setLayout(main_layout)
-    
-    def get_values(self):
-        return self.cob_fit.currentIndex(), self.x_combo.currentIndex()
 
 
 class BatchAnalyzeDialog(QDialog):
@@ -1796,70 +1746,7 @@ class FittingDialog(QDialog):
         custom_expr = self.custom_func_input.text() if func == "Custom" else None
         return func, values, fixed, custom_expr
 
-import numpy as np
 from scipy.optimize import OptimizeWarning, curve_fit
-from skimage.feature import blob_log
-
-def two_d_gaussian(xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
-    """2d gaussian (angled) used for fitting the MOT
-
-    Args:
-        xy (tuple of arrays): x,y coordinates
-        amplitude (float): 
-        xo (float): center x
-        yo (float): center y
-        sigma_x (float): 
-        sigma_y (float): 
-        theta (float): angle with y axis
-        offset (float): background
-
-    Returns:
-        1d array: gaussian raveled to 1d
-    """
-
-    x, y = xy
-    xo = float(xo)
-    yo = float(yo)  
-
-    # compute 2d gaussian fuction  
-    a = (np.cos(theta)**2)/(2*sigma_x**2) + (np.sin(theta)**2)/(2*sigma_y**2)
-    b = -(np.sin(2*theta))/(4*sigma_x**2) + (np.sin(2*theta))/(4*sigma_y**2)
-    c = (np.sin(theta)**2)/(2*sigma_x**2) + (np.cos(theta)**2)/(2*sigma_y**2)
-    g = offset + amplitude*np.exp(-(a*((x-xo)**2) + 2*b*(x-xo)*(y-yo) + c*((y-yo)**2)))
-
-    # return raveled for fit
-    return g.ravel()
-
-def donut(xy, amplitude, xo, yo, sigma, r, offset):
-
-    x, y = xy
-    xo = float(xo)
-    yo = float(yo)  
-
-    g = offset + amplitude*np.exp(-(np.sqrt((x-xo)**2 + (y-yo)**2)-r)**2/sigma**2)
-
-    return g.ravel()
-
-def elliptical_donut(xy, amplitude, xo, yo, sigma, r_x, r_y, theta, offset):
-
-    x, y = xy
-    xo = float(xo)
-    yo = float(yo)
-
-    x_shift = x - xo
-    y_shift = y - yo
-
-    cos_t = np.cos(theta)
-    sin_t = np.sin(theta)
-
-    x_rot =  cos_t * x_shift + sin_t * y_shift
-    y_rot = -sin_t * x_shift + cos_t * y_shift
-
-    r_ell = np.sqrt((x_rot / r_x)**2 + (y_rot / r_y)**2)
-
-    g = offset + amplitude * np.exp(-((r_ell - 1)**2) / sigma**2)
-
-    return g.ravel()
 
 def gaussian(x, a, b, c, d):
     """amp * exp(-(x - x0)^2 / (2 * sig^2)) + y0"""
@@ -1922,19 +1809,6 @@ class Fitter():
             c = xrange/10
         return [a, b, c, d]
 
-    def guess_oscillation_fft(self, x, y):
-        # guess the parameters for an oscillatory signal: 
-        # amplitude a, freuency f, phase phi, and offset d\
-        x_space = min(np.diff(np.sort(x)))# don't assume uniform spacing
-        ff = np.fft.fftfreq(len(x), x_space)   
-        # ff = np.fft.fftfreq(len(self.xdata), (self.xdata[1]-self.xdata[0]))   # assume uniform spacing
-        Fyy = abs(np.fft.fft(y))
-        Fyy[ff > 1/x_space] = 0 #exclude everything bigger than the sampling rate
-        f = abs(ff[np.argmax(Fyy[1:])+1])   # excluding the zero frequency "peak", which is related to offset
-        a = np.std(y) * 2.**0.5
-        d = np.mean(y)
-        return [a, 2.*np.pi*f, 0., d]
-
     def guess_oscillation(self, x, y):
         # guess the parameters for an oscillatory signal: 
         # amplitude a, freuency f, phase phi, and offset d
@@ -1984,17 +1858,6 @@ class Fitter():
             p = np.polyfit(x, y, deg=n)
             return list(p)
         return guess
-
-    # def guess_fidelity(self):
-    #     # we have to guess a start value, t0, asymptotic value, and decay rate
-    #     yrng = self.ydata.max() - self.ydata.min()
-    #     xrng = self.xdata.max() - self.xdata.min()
-    #     i0 = self.xdata.argmin()
-    #     i_end = self.xdata.argmax()
-    #     amp = yrng
-    #     gamma = 2/xrng #guess half the range for the decay time
-    #     x0 = self.xdata.min()
-    #     self.p0 = [0.05,1]
 
     def fix_params(self, func, fixed_params):
         def wrapper(x, *free_params):
@@ -2248,8 +2111,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         self._rebuild_main_layout()
         self.cob_x.currentIndexChanged.connect(self.set_x)
-        if getattr(self, "cob_curves_x", None) is not None:
-            self.cob_curves_x.currentIndexChanged.connect(self._on_curves_x_changed)
         self.scrollbar.valueChanged.connect(self.change_plot)
         self.bt_import.clicked.connect(self.import_data)
 
@@ -2257,12 +2118,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.setWindowTitle("Scan Plot")
         self.set_focused_dock(self.curves_dock)
         self.skip = False
-
-    def _toolbar_sep(self):
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.VLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        return line
 
     def _rebuild_main_layout(self):
         """Dockable Curves / analysis / browser panels (no global Analyze toolbar)."""
@@ -2356,9 +2211,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         plot_col = QVBoxLayout(plot_col_w)
         plot_col.setContentsMargins(4, 4, 4, 4)
         self.curves_dim_state = {}
-        self.curves_dim_bar = QWidget()
-        self.curves_dim_layout = QHBoxLayout(self.curves_dim_bar)
-        self.curves_dim_bar.hide()
         self.scrollbar.hide()
         plot_col.addWidget(self.scrollbar)
         self.pw_plot.setSizePolicy(
@@ -2533,9 +2385,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             cob_fit=ana.cob_fit,
             bt_fit=ana.bt_fit,
             bt_clear=ana.bt_clear,
-            bt_2d=ana.bt_2d,
-            bt_batch=ana.bt_batch,
-            bt_roi_grid=ana.bt_roi_grid,
             bt_export=ana.bt_export,
             bt_derive=derive.bt_fit_param,
             bt_copy=ana.bt_copy,
@@ -2586,11 +2435,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self,
         dock,
         *,
-        with_x=False,
         with_style=True,
         with_fit=True,
-        with_curves_actions=False,
-        with_derive=False,
         with_copy=True,
     ):
         """Per-dock View/Style/Fit strip — travels with the floating/docked window."""
@@ -2599,10 +2445,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         row.setContentsMargins(4, 2, 4, 2)
         row.setSpacing(4)
         ctrls = SimpleNamespace()
-
-        # Legacy with_x path removed from Curves; EncodingPanel owns X/dims.
-        # Keep flag for any external callers — no-op UI.
-        _ = with_x
 
         if with_style:
             ctrls.chk_legend = QCheckBox("Legend")
@@ -2644,42 +2486,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             row.addWidget(ctrls.cob_fit)
             row.addWidget(ctrls.bt_fit)
             row.addWidget(ctrls.bt_clear)
-
-        if with_curves_actions:
-            ctrls.bt_2d = QPushButton("2D")
-            ctrls.bt_batch = QPushButton("Batch fit")
-            ctrls.bt_roi_grid = QPushButton("ROI grid")
-            ctrls.bt_export = QPushButton("Export")
-            ctrls.bt_2d.setToolTip(
-                "Measurement value vs two scan axes (pick axes in dialog)."
-            )
-            ctrls.bt_batch.setToolTip(
-                "Fit along Curve axis; plot fit params vs scan time / scan axis / ROI."
-            )
-            ctrls.bt_roi_grid.setToolTip(
-                "Fit all ROIs; show one fit parameter as a rows×cols grid."
-            )
-            ctrls.bt_export.setToolTip("Open current curve in a new dock + copy TSV")
-            ctrls.bt_2d.clicked.connect(lambda _=False, d=dock: self.two_d_plot(dock=d))
-            ctrls.bt_batch.clicked.connect(
-                lambda _=False, d=dock: self.batch_fit_selected(dock=d)
-            )
-            ctrls.bt_roi_grid.clicked.connect(
-                lambda _=False, d=dock: self.generate_heatmap(dock=d)
-            )
-            ctrls.bt_export.clicked.connect(self.export_plot)
-            row.addWidget(ctrls.bt_2d)
-            row.addWidget(ctrls.bt_batch)
-            row.addWidget(ctrls.bt_roi_grid)
-            row.addWidget(ctrls.bt_export)
-
-        if with_derive:
-            ctrls.bt_derive = QPushButton("Derive")
-            ctrls.bt_derive.setToolTip(
-                "Fit along current X for each series; open one new plot of a single fit parameter."
-            )
-            ctrls.bt_derive.clicked.connect(lambda _=False, d=dock: self.derive_fit_param_plot(dock=d))
-            row.addWidget(ctrls.bt_derive)
 
         if with_copy:
             ctrls.bt_copy = QToolButton()
@@ -3043,10 +2849,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             n += 1
         return name
 
-    def show_plot_tab(self, title, widget, kind="export", floating=False, recipe=None):
-        """Backward-compatible alias → show_plot_dock."""
-        return self.show_plot_dock(title, widget, kind=kind, floating=floating, recipe=recipe)
-
     def _place_floating_dock(self, dock, w_frac=0.58, h_frac=0.62):
         """Center a floating dock over the main window with a usable size."""
         geo = self.geometry()
@@ -3092,7 +2894,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         dock = PlotDock(self._unique_dock_name(title), kind, page, parent=self, closable=True)
         dock.plot_widget = widget
         dock.state.recipe = recipe
-        curve_kinds = ("export", "batch", "derived_merge", "derived_global")
+        curve_kinds = ("export", "batch")
         if kind in curve_kinds:
             # Batch multi-panel: Fit yes; Style only helps when cached_xy / derived
             layout.addWidget(
@@ -3112,10 +2914,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     with_copy=True,
                 )
             )
-        # Same X / Curve axis / Dimensions encoding as Curves (for live scan plots)
-        if kind in ("derived_merge", "derived_global"):
-            enc = self._build_dock_encoding_panel(dock)
-            layout.addWidget(enc)
         layout.addWidget(widget, stretch=1)
         dock.closed.connect(self._on_plot_dock_closed)
         dock.activated.connect(self.set_focused_dock)
@@ -3619,16 +3417,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if need_rebuild:
             self.set_x(fit_i)
 
-    def _on_dock_encoding_changed_universal(self, dock):
-        panel = getattr(dock, "encoding_panel", None)
-        if panel is None or self.skip:
-            return
-        enc = panel.read_encoding()
-        prev = dock.state.encoding or {}
-        enc["y_channel"] = prev.get("y_channel") or Y_CHANNEL_MEASUREMENT
-        dock.state.encoding = enc
-        self._redraw_universal_dock(dock)
-
     def _fit_along_index(self):
         return self.cob_x.currentIndex() if self.cob_x.count() else 0
 
@@ -3642,149 +3430,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             return data[0], data[1]
         # Fallback: treat as axis by index
         return CURVES_X_AXIS, max(0, cob.currentIndex())
-
-    def _sync_curve_axis_visibility(self):
-        """Curve axis + Reduce only when X is ROI / scan time."""
-        kind, _ = self._curves_x_selection()
-        show = kind in (CURVES_X_ROI, CURVES_X_TIME)
-        for w in (
-            getattr(self, "lb_curve_axis", None),
-            getattr(self, "lb_fit_along", None),
-            self.cob_x,
-            getattr(self, "lb_curve_reduce", None),
-            getattr(self, "cob_curve_reduce", None),
-            getattr(self, "cob_curve_reduce_val", None),
-        ):
-            if w is None:
-                continue
-            w.setVisible(show)
-        if show:
-            self._sync_curve_reduce_widgets()
-        # When X is a scan axis, Curve axis == X (hidden)
-        if kind == CURVES_X_AXIS:
-            _, axis_i = self._curves_x_selection()
-            if axis_i is not None and 0 <= axis_i < self.cob_x.count() and self.cob_x.currentIndex() != axis_i:
-                self.skip = True
-                self.cob_x.setCurrentIndex(axis_i)
-                self.skip = False
-
-    def _sync_fit_along_visibility(self):
-        """Backward-compatible alias."""
-        self._sync_curve_axis_visibility()
-
-    def _sync_curve_reduce_widgets(self):
-        """Fill Reduce value combo from Curve axis unique values; apply dim_state."""
-        cob_m = getattr(self, "cob_curve_reduce", None)
-        cob_v = getattr(self, "cob_curve_reduce_val", None)
-        if cob_m is None or cob_v is None:
-            return
-        scan = self.primary_scan()
-        i = self._fit_along_index()
-        dkey = f"fit:{i}"
-        st = self._dim_state(dkey, default_mode="mean")
-        self.skip = True
-        mode = st.get("mode") or "mean"
-        idx = cob_m.findData(mode)
-        if idx < 0:
-            idx = 0
-            mode = "mean"
-            st["mode"] = mode
-        cob_m.setCurrentIndex(idx)
-        vals = self._unique_axis_values(scan, i) if scan is not None else []
-        cob_v.clear()
-        for v in vals:
-            cob_v.addItem(f"{v:g}", v)
-        if st.get("value") is not None and vals:
-            nearest = min(vals, key=lambda v: abs(v - float(st["value"])))
-            cob_v.setCurrentIndex(vals.index(nearest))
-            st["value"] = nearest
-        elif vals:
-            st["value"] = vals[0]
-        cob_v.setEnabled(mode == "one")
-        self.skip = False
-
-    def _on_curve_reduce_changed(self, _index=0):
-        if self.skip:
-            return
-        cob_m = self.cob_curve_reduce
-        cob_v = self.cob_curve_reduce_val
-        i = self._fit_along_index()
-        st = self._dim_state(f"fit:{i}", default_mode="mean")
-        st["mode"] = cob_m.currentData() or "mean"
-        cob_v.setEnabled(st["mode"] == "one")
-        self.draw_plot()
-
-    def _on_curve_reduce_val_changed(self, _index=0):
-        if self.skip:
-            return
-        i = self._fit_along_index()
-        st = self._dim_state(f"fit:{i}", default_mode="mean")
-        st["value"] = self.cob_curve_reduce_val.currentData()
-        self.draw_plot()
-
-    def _populate_curves_x_combo(self, scan=None):
-        """Fill Curves X with scan axes + ROI + scan time."""
-        cob = getattr(self, "cob_curves_x", None)
-        if cob is None:
-            return
-        scan = scan or self.primary_scan()
-        prev = cob.currentData()
-        self.skip = True
-        cob.clear()
-        labels = self._axis_labels(scan) if scan is not None else ["repetition"]
-        key_sets = (scan.metadata.get("key_sets") if scan else None) or []
-        if key_sets:
-            for i, key in enumerate(key_sets):
-                cob.addItem(key[-1], (CURVES_X_AXIS, i))
-        else:
-            cob.addItem(labels[0] if labels else "repetition", (CURVES_X_AXIS, 0))
-        cob.addItem("ROI", (CURVES_X_ROI, None))
-        cob.addItem("scan time", (CURVES_X_TIME, None))
-        # Restore previous selection if still present
-        restore = 0
-        if prev is not None:
-            for i in range(cob.count()):
-                if cob.itemData(i) == prev:
-                    restore = i
-                    break
-        cob.setCurrentIndex(restore)
-        self.skip = False
-        self._sync_fit_along_visibility()
-
-    def _on_curves_x_changed(self, _index=0):
-        if self.skip:
-            return
-        kind, axis_i = self._curves_x_selection()
-        self._sync_fit_along_visibility()
-        if kind == CURVES_X_AXIS and axis_i is not None:
-            if 0 <= axis_i < self.cob_x.count():
-                if self.cob_x.currentIndex() != axis_i:
-                    self.cob_x.setCurrentIndex(axis_i)  # triggers set_x
-                else:
-                    self.set_x(axis_i)  # same axis index — still need axis-mode redraw
-            else:
-                self.set_x(axis_i)
-            return
-        # ROI / time: keep Fit along plots; just redraw
-        if not self.scans:
-            return
-        fit_along = self._fit_along_index()
-        for scan in self.scans:
-            self._ensure_scan_plots(scan, fit_along)
-        self.sync_primary_aliases()
-        primary = self.primary_scan()
-        if primary is not None and primary.plots is not None:
-            self.scrollbar.setRange(0, max(primary.plots.n_plots() - 1, 0))
-        func = primary.metadata["function"] if primary else ""
-        self.pw_plot.setLabel("left", func, **font)
-        self.pw_plot.setLabel(
-            "bottom",
-            "ROI" if kind == CURVES_X_ROI else "Δt from first scan (s)",
-            **font,
-        )
-        self._rebuild_curves_dim_bar()
-        self.draw_plot()
-        self.set_title()
 
     def _collapse_curve_point(self, scan, slice_index, roi, x_pick=None):
         """Collapse a 1D curve to one (y, yerr) for ROI/time display X.
@@ -3842,92 +3487,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         st = self.curves_dim_state.setdefault(key, {"mode": default_mode, "value": None})
         return st
 
-    def _rebuild_curves_dim_bar(self):
-        """Dimensions row: remaining scan axes only (One / All). ROI/scans = Browser."""
-        lay = getattr(self, "curves_dim_layout", None)
-        if lay is None:
-            return
-        while lay.count():
-            item = lay.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-        scan = self.primary_scan()
-        if scan is None:
-            self.curves_dim_bar.hide()
-            return
-
-        kind, x_axis = self._curves_x_selection()
-        fit_along = self._fit_along_index()
-        key_sets = scan.metadata.get("key_sets") or []
-        rows = []
-
-        tip = QLabel("Dimensions:")
-        tip.setStyleSheet(f"color: {THEME['muted']};")
-        tip.setToolTip(
-            "Remaining scan axes: One (fix value) or All (overlay). "
-            "ROI / scans: select in Browser."
-        )
-        lay.addWidget(tip)
-        note = QLabel("ROI/scans → Browser")
-        note.setStyleSheet(f"color: {THEME['muted']}; font-size: 11px;")
-        lay.addWidget(note)
-
-        for i, key in enumerate(key_sets):
-            name = key[-1]
-            if kind == CURVES_X_AXIS and i == x_axis:
-                continue
-            # Curve axis handled on main strip (Reduce), not here
-            if kind in (CURVES_X_ROI, CURVES_X_TIME) and i == fit_along:
-                continue
-
-            dkey = f"axis:{i}"
-            st = self._dim_state(dkey, default_mode="one")
-            box = QWidget()
-            row = QHBoxLayout(box)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(2)
-            row.addWidget(QLabel(f"{name}:"))
-            mode = QComboBox()
-            mode.addItem("One", "one")
-            mode.addItem("All", "all")
-            mode.setCurrentIndex(0 if st["mode"] != "all" else 1)
-            vals = self._unique_axis_values(scan, i)
-            val_cob = QComboBox()
-            for v in vals:
-                val_cob.addItem(f"{v:g}", v)
-            if st["value"] is not None and vals:
-                nearest = min(vals, key=lambda v: abs(v - float(st["value"])))
-                val_cob.setCurrentIndex(vals.index(nearest))
-                st["value"] = nearest
-            elif vals:
-                st["value"] = vals[0]
-            val_cob.setEnabled(st["mode"] == "one")
-            val_cob.setMinimumWidth(80)
-
-            def _on_ax_mode(m, k=dkey, vc=val_cob):
-                self.curves_dim_state[k]["mode"] = m
-                vc.setEnabled(m == "one")
-                self.draw_plot()
-
-            def _on_ax_val(_t, k=dkey, vc=val_cob):
-                self.curves_dim_state[k]["value"] = vc.currentData()
-                self.draw_plot()
-
-            mode.currentIndexChanged.connect(
-                lambda _=0, c=mode: _on_ax_mode(c.currentData())
-            )
-            val_cob.currentIndexChanged.connect(_on_ax_val)
-            row.addWidget(mode)
-            row.addWidget(val_cob)
-            lay.addWidget(box)
-            rows.append(box)
-
-        lay.addStretch(1)
-        # Legacy dim bar replaced by EncodingPanel — keep hidden
-        self.curves_dim_bar.setVisible(False)
-
     def _curves_roi_indices(self):
         """ROI from Curves encoding dim panel."""
         enc = getattr(self.curves_dock.state, "encoding", None) or {}
@@ -3947,17 +3506,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if enc.get("dims") is not None:
             return self._encoding_scan_indices(enc)
         return self.selected_scan_indices()
-
-    def _fit_along_pick(self):
-        """None = mean over curve; float = One value on Fit along (ROI/time X)."""
-        kind, _ = self._curves_x_selection()
-        if kind not in (CURVES_X_ROI, CURVES_X_TIME):
-            return None
-        i = self._fit_along_index()
-        st = self.curves_dim_state.get(f"fit:{i}", {"mode": "mean"})
-        if st.get("mode") == "one":
-            return st.get("value")
-        return None
 
     def _curve_axis_expand_picks(self, scan):
         """When X is ROI/scan: how to expand the curve axis (pulse_detuning etc.).
@@ -4137,42 +3685,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             r.pop("roi", None)
         return r
 
-    def refresh_all_analysis(self, checked=False):
-        """Re-run analysis docks with *current* Browser/Curves context.
-
-        Recipes keep the analysis kind (batch outer, ROI grid param, 2D axes…).
-        Scan/ROI/slice/Fit-along come from the live UI — not the frozen recipe.
-        `checked` absorbs QPushButton.clicked(bool) — required on PyQt6.
-        """
-        _ = checked
-        targets = [
-            d for d in list(self.plot_docks)
-            if d is not self.curves_dock
-            and isinstance(getattr(d.state, "recipe", None), dict)
-            and d.state.recipe.get("type") in ("export", "2d", "heatmap", "batch")
-        ]
-        if not targets:
-            self.statusBar().showMessage("Refresh all: no analysis docks with recipes", 3000)
-            return
-        recipes = [self._recipe_for_live_refresh(d.state.recipe) for d in targets]
-        for d in targets:
-            try:
-                d.close()
-            except Exception:
-                pass
-        ok, fail = 0, 0
-        for rec in recipes:
-            try:
-                self._replay_tab_recipe(rec, restore_ui_context=False)
-                ok += 1
-            except Exception as exc:
-                fail += 1
-                logging.exception("Refresh failed for %s: %s", rec.get("title"), exc)
-        self.statusBar().showMessage(
-            f"Refresh all: {ok} ok" + (f", {fail} failed" if fail else ""),
-            5000,
-        )
-
     def sync_primary_aliases(self):
         scan = self.primary_scan()
         if scan is None:
@@ -4276,20 +3788,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         )
         if ans == QMessageBox.StandardButton.Yes:
             self.clear_scans()
-
-    def _scans_context_menu(self, pos):
-        menu = QMenu(self)
-        act_merge = menu.addAction("Merge selected → new dock")
-        act_global = menu.addAction("Global (sum ROIs) → new dock")
-        menu.addSeparator()
-        act_clear = menu.addAction("Clear all…")
-        chosen = menu.exec(self.list_scans.mapToGlobal(pos))
-        if chosen is act_merge:
-            self.merge_selected_scans()
-        elif chosen is act_global:
-            self.globalify()
-        elif chosen is act_clear:
-            self._confirm_clear_scans()
 
     def _experiments_context_menu(self, pos):
         menu = QMenu(self)
@@ -4415,13 +3913,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not selected_any and n > 0:
             self.list_roi.item(default_roi).setSelected(True)
         self.skip = False
-
-    def add_all_points(self, scan=None):
-        scan = scan or self.primary_scan()
-        if scan is None or scan.plots is None:
-            return
-        for i, result in enumerate(scan.data):
-            scan.plots.add_point(scan.metadata["points"][i], result)
 
     def build_plots_for_scan(self, scan, x_index):
         plots = Plots(x_index)
@@ -4830,40 +4321,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         return unique_x, means, errors
     
-    def globalify(self):
-        """Non-destructive: sum ROIs into a derived floating dock (not Loaded scans)."""
-        scan = self.primary_scan()
-        n_loaded_before = len(self.scans)
-        if scan is None:
-            logging.error("No scan loaded")
-            return
-        if not scan.data or len(scan.data[0]) < 2:
-            logging.error("Data is already global / single-ROI")
-            return
-
-        meta = copy.deepcopy(scan.metadata)
-        if meta["function"] == "Survival probability":
-            meta["function"] = "Global survival"
-        else:
-            meta["function"] = "Global " + meta["function"]
-        data = []
-        for point in scan.data:
-            if isinstance(point[0], (list, tuple, np.ndarray)):
-                data.append([[sum(x[0] for x in point), sum(x[1] for x in point)]])
-            else:
-                data.append([sum(point)])
-        derived = ScanDataset(
-            name=f"global_{self._scan_short_name(scan)}",
-            path=scan.path,
-            metadata=meta,
-            data=data,
-        )
-        self._open_derived_dock(derived, kind="derived_global", title=f"Global: {self._scan_short_name(scan)}")
-
-    def write_fit_params(self, params, popt, perr):
-        s = ", ".join([p + " = " + self.format_fit_params(v, e) for p, v, e in zip(params, popt, perr)])
-        self.lb_fit.setText(s)
-    
     def format_fit_params(self, value, error):
         if value == 0:
             return "0"
@@ -4889,12 +4346,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         value_str = f"{rounded_value:.{unc_digits}f}"
 
         return f"{value_str}({error_digits})e{exponent}"
-
-    def add_point(self):
-        i = len(self.data)-1
-        point = self.metadata["points"][i]
-        self.plots.add_point(point, self.data[-1])
-        self.draw_plot()
 
     def set_title(self):
         enc = (self.curves_dock.state.encoding or {}) if getattr(self, "curves_dock", None) else {}
@@ -4965,16 +4416,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.draw_plot()
         self.set_title()
         self._update_curves_analyze_enabled()
-
-    def data_changed(self, value, metadata, persist, mods):
-        self.data = value[self.data_name]
-        l = len(self.data)
-        if mods[0]["action"] == "init" or l == 1:
-            self.create_new_plot()
-        elif l == 0:
-            return
-        else:
-            self.add_point()
 
     def clear_fit(self, dock=None):
         """Clear fits on the given (or focused) dock (Curves / derived / snapshot)."""
@@ -5256,10 +4697,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             f"{p}={self.format_fit_params(v, e)}" for p, v, e in zip(params, popt, perr)
         )
         self.statusBar().showMessage(f"Fit: {summary}", 8000)
-
-    def advanced_fit(self):
-        """Legacy entry — route to focused dock."""
-        self._dock_advanced_fit(self.focused_plot_dock())
 
     def _colorbar_levels_from_dock(self, dock, img_data):
         """Return (vmin, vmax) for an image, respecting dock Style colorbar settings."""
@@ -6377,10 +5814,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         out = [int(v) for v in vals if 0 <= int(v) < n]
         return out if out else all_i[:1]
 
-    def _dim_catalog_for_scan(self, scan):
-        """Minimal dim catalog for a single ScanDataset."""
-        return self._dim_catalog_for_scans([scan] if scan is not None else [])
-
     def _dim_catalog_for_scans(self, scans):
         """Dim catalog for one or more ScanDatasets (scan dim lists all members)."""
         if not scans:
@@ -7413,13 +6846,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         out = self.show_plot_dock(title, glw, kind="heatmap", recipe=rec)
         self._record_tab_recipe(rec, dock=out)
 
-    def count_clusters(self, values, threshold=3):
-        if len(values) == 1:
-            return 1
-        values = np.sort(values).reshape(-1, 1)
-        clusters = fcluster(linkage(values, method="single"), threshold, criterion="distance")
-        return len(np.unique(clusters))
-
     def import_data(self):
         dialog = ScanPickerDialog(FOLDER, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -7462,44 +6888,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.rebuild_scan_list_widget(select_indices=sorted(set(prev) | set(select)))
         self.create_new_plot()
 
-    def merge_selected_scans(self):
-        """Non-destructive: concatenate all loaded scans into a derived floating dock."""
-        idxs = list(range(len(self.scans)))
-        if len(idxs) < 2:
-            logging.error("Need at least two loaded scans to merge")
-            return
-        scans = [self.scans[i] for i in idxs]
-        ref = scans[0]
-        for s in scans[1:]:
-            if s.metadata["key_sets"] != ref.metadata["key_sets"]:
-                logging.error("Cannot merge: key_sets differ (%s vs %s)", ref.name, s.name)
-                return
-            if s.metadata["function"] != ref.metadata["function"]:
-                logging.error("Cannot merge: function differ (%s vs %s)", ref.name, s.name)
-                return
-            if ref.data and s.data and len(s.data[0]) != len(ref.data[0]):
-                logging.error("Cannot merge: ROI count differs (%s vs %s)", ref.name, s.name)
-                return
-
-        merged = ScanDataset(
-            name="merged_" + "_".join(self._scan_short_name(s) for s in scans),
-            path=ref.path,
-            metadata={
-                "key_sets": copy.deepcopy(ref.metadata["key_sets"]),
-                "points": [],
-                "function": ref.metadata["function"],
-            },
-            data=[],
-        )
-        for s in scans:
-            merged.metadata["points"].extend(copy.deepcopy(s.metadata["points"]))
-            merged.data.extend(copy.deepcopy(s.data))
-
-        title = "Merge: " + "+".join(self._scan_short_name(s) for s in scans[:3])
-        if len(scans) > 3:
-            title += f"+{len(scans) - 3}"
-        self._open_derived_dock(merged, kind="derived_merge", title=title)
-
     def _sync_dock_ctrls_from_state(self, dock):
         """Push PlotViewState into that dock's control widgets (no redraw signals)."""
         ctrls = getattr(dock, "ctrls", None)
@@ -7528,316 +6916,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 ctrls.cob_fit.blockSignals(True)
                 ctrls.cob_fit.setCurrentIndex(i)
                 ctrls.cob_fit.blockSignals(False)
-
-    def _build_dock_encoding_panel(self, dock):
-        """Per-dock X / Curve axis / Reduce / Dimensions (same model as Curves)."""
-        panel = QWidget()
-        col = QVBoxLayout(panel)
-        col.setContentsMargins(2, 2, 2, 2)
-        col.setSpacing(2)
-        row = QHBoxLayout()
-        row.setSpacing(4)
-        enc = SimpleNamespace()
-
-        row.addWidget(QLabel("X:"))
-        enc.cob_x_dim = QComboBox()
-        enc.cob_x_dim.setToolTip("Horizontal axis: scan parameter, ROI, or scan time.")
-        row.addWidget(enc.cob_x_dim)
-
-        enc.lb_curve = QLabel("Curve axis:")
-        enc.cob_curve = QComboBox()
-        enc.cob_curve.setToolTip("Scan axis used to build 1D curves.")
-        row.addWidget(enc.lb_curve)
-        row.addWidget(enc.cob_curve)
-
-        enc.lb_reduce = QLabel("Reduce:")
-        enc.cob_reduce = QComboBox()
-        enc.cob_reduce.addItem("Mean (all)", "mean")
-        enc.cob_reduce.addItem("One", "one")
-        enc.cob_reduce_val = QComboBox()
-        enc.cob_reduce_val.setMinimumWidth(80)
-        enc.cob_reduce_val.setEnabled(False)
-        row.addWidget(enc.lb_reduce)
-        row.addWidget(enc.cob_reduce)
-        row.addWidget(enc.cob_reduce_val)
-        row.addStretch(1)
-        col.addLayout(row)
-
-        enc.dim_bar = QWidget()
-        enc.dim_layout = QHBoxLayout(enc.dim_bar)
-        enc.dim_layout.setContentsMargins(4, 0, 4, 0)
-        enc.dim_layout.setSpacing(6)
-        col.addWidget(enc.dim_bar)
-
-        dock.enc_ctrls = enc
-        enc.cob_x_dim.currentIndexChanged.connect(
-            lambda _=0, d=dock: self._on_dock_encoding_changed(d)
-        )
-        enc.cob_curve.currentIndexChanged.connect(
-            lambda _=0, d=dock: self._on_dock_encoding_changed(d)
-        )
-        enc.cob_reduce.currentIndexChanged.connect(
-            lambda _=0, d=dock: self._on_dock_encoding_changed(d)
-        )
-        enc.cob_reduce_val.currentIndexChanged.connect(
-            lambda _=0, d=dock: self._on_dock_encoding_changed(d)
-        )
-        return panel
-
-    def _populate_dock_encoding(self, dock):
-        scan = dock.state.derived_scan
-        enc = getattr(dock, "enc_ctrls", None)
-        if scan is None or enc is None:
-            return
-        self.skip = True
-        enc.cob_x_dim.clear()
-        enc.cob_curve.clear()
-        key_sets = scan.metadata.get("key_sets") or []
-        if key_sets:
-            for i, key in enumerate(key_sets):
-                enc.cob_x_dim.addItem(key[-1], (CURVES_X_AXIS, i))
-                enc.cob_curve.addItem(key[-1], i)
-        else:
-            enc.cob_x_dim.addItem("repetition", (CURVES_X_AXIS, 0))
-            enc.cob_curve.addItem("repetition", 0)
-        enc.cob_x_dim.addItem("ROI", (CURVES_X_ROI, None))
-        enc.cob_x_dim.addItem("scan time", (CURVES_X_TIME, None))
-        # Default X = curve axis index from dock.state.x_index
-        xi = dock.state.x_index if dock.state.x_index is not None else 0
-        if 0 <= xi < enc.cob_curve.count():
-            enc.cob_curve.setCurrentIndex(xi)
-        for i in range(enc.cob_x_dim.count()):
-            data = enc.cob_x_dim.itemData(i)
-            if data == (CURVES_X_AXIS, xi):
-                enc.cob_x_dim.setCurrentIndex(i)
-                break
-        self.skip = False
-        self._sync_dock_encoding_visibility(dock)
-        self._rebuild_dock_dim_bar(dock)
-
-    def _dock_x_selection(self, dock):
-        enc = getattr(dock, "enc_ctrls", None)
-        if enc is None or enc.cob_x_dim.count() == 0:
-            return CURVES_X_AXIS, dock.state.x_index or 0
-        data = enc.cob_x_dim.currentData()
-        if isinstance(data, (tuple, list)) and len(data) == 2:
-            return data[0], data[1]
-        return CURVES_X_AXIS, 0
-
-    def _dock_curve_axis_index(self, dock):
-        enc = getattr(dock, "enc_ctrls", None)
-        if enc is None or enc.cob_curve.count() == 0:
-            return dock.state.x_index or 0
-        data = enc.cob_curve.currentData()
-        return int(data) if data is not None else 0
-
-    def _sync_dock_encoding_visibility(self, dock):
-        enc = getattr(dock, "enc_ctrls", None)
-        if enc is None:
-            return
-        kind, axis_i = self._dock_x_selection(dock)
-        show = kind in (CURVES_X_ROI, CURVES_X_TIME)
-        for w in (enc.lb_curve, enc.cob_curve, enc.lb_reduce, enc.cob_reduce, enc.cob_reduce_val):
-            w.setVisible(show)
-        if kind == CURVES_X_AXIS and axis_i is not None:
-            # Keep curve axis synced to X
-            for i in range(enc.cob_curve.count()):
-                if enc.cob_curve.itemData(i) == axis_i:
-                    if enc.cob_curve.currentIndex() != i:
-                        self.skip = True
-                        enc.cob_curve.setCurrentIndex(i)
-                        self.skip = False
-                    break
-        if show:
-            self._sync_dock_reduce_widgets(dock)
-
-    def _sync_dock_reduce_widgets(self, dock):
-        enc = getattr(dock, "enc_ctrls", None)
-        scan = dock.state.derived_scan
-        if enc is None or scan is None:
-            return
-        i = self._dock_curve_axis_index(dock)
-        st = dock.state.encoding_dim_state.setdefault(f"fit:{i}", {"mode": "mean", "value": None})
-        self.skip = True
-        mode = st.get("mode") or "mean"
-        mi = enc.cob_reduce.findData(mode)
-        enc.cob_reduce.setCurrentIndex(mi if mi >= 0 else 0)
-        vals = self._unique_axis_values(scan, i)
-        enc.cob_reduce_val.clear()
-        for v in vals:
-            enc.cob_reduce_val.addItem(f"{v:g}", v)
-        if st.get("value") is not None and vals:
-            nearest = min(vals, key=lambda v: abs(v - float(st["value"])))
-            enc.cob_reduce_val.setCurrentIndex(vals.index(nearest))
-            st["value"] = nearest
-        elif vals:
-            st["value"] = vals[0]
-        enc.cob_reduce_val.setEnabled(mode == "one")
-        self.skip = False
-
-    def _rebuild_dock_dim_bar(self, dock):
-        enc = getattr(dock, "enc_ctrls", None)
-        scan = dock.state.derived_scan
-        if enc is None or scan is None:
-            return
-        lay = enc.dim_layout
-        while lay.count():
-            item = lay.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        kind, x_axis = self._dock_x_selection(dock)
-        curve_i = self._dock_curve_axis_index(dock)
-        tip = QLabel("Dimensions:")
-        tip.setStyleSheet(f"color: {THEME['muted']};")
-        tip.setToolTip("Remaining scan axes: One (fixed) or All (overlay).")
-        lay.addWidget(tip)
-        key_sets = scan.metadata.get("key_sets") or []
-        for i, key in enumerate(key_sets):
-            if kind == CURVES_X_AXIS and i == x_axis:
-                continue
-            if kind in (CURVES_X_ROI, CURVES_X_TIME) and i == curve_i:
-                continue
-            dkey = f"axis:{i}"
-            st = dock.state.encoding_dim_state.setdefault(dkey, {"mode": "one", "value": None})
-            box = QWidget()
-            row = QHBoxLayout(box)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(2)
-            row.addWidget(QLabel(f"{key[-1]}:"))
-            mode = QComboBox()
-            mode.addItem("One", "one")
-            mode.addItem("All", "all")
-            mode.setCurrentIndex(0 if st.get("mode") != "all" else 1)
-            vals = self._unique_axis_values(scan, i)
-            val_cob = QComboBox()
-            for v in vals:
-                val_cob.addItem(f"{v:g}", v)
-            if st.get("value") is not None and vals:
-                nearest = min(vals, key=lambda v: abs(v - float(st["value"])))
-                val_cob.setCurrentIndex(vals.index(nearest))
-                st["value"] = nearest
-            elif vals:
-                st["value"] = vals[0]
-            val_cob.setEnabled(st.get("mode") != "all")
-
-            def _on_mode(m, d=dock, k=dkey, vc=val_cob):
-                d.state.encoding_dim_state[k]["mode"] = m
-                vc.setEnabled(m == "one")
-                self._redraw_derived_dock(d)
-
-            def _on_val(_t, d=dock, k=dkey, vc=val_cob):
-                d.state.encoding_dim_state[k]["value"] = vc.currentData()
-                self._redraw_derived_dock(d)
-
-            mode.currentIndexChanged.connect(lambda _=0, c=mode: _on_mode(c.currentData()))
-            val_cob.currentIndexChanged.connect(_on_val)
-            row.addWidget(mode)
-            row.addWidget(val_cob)
-            lay.addWidget(box)
-        lay.addStretch(1)
-
-    def _on_dock_encoding_changed(self, dock):
-        if self.skip:
-            return
-        scan = dock.state.derived_scan
-        if scan is None:
-            return
-        kind, axis_i = self._dock_x_selection(dock)
-        curve_i = self._dock_curve_axis_index(dock)
-        # Persist reduce mode into encoding_dim_state
-        enc = dock.enc_ctrls
-        st = dock.state.encoding_dim_state.setdefault(f"fit:{curve_i}", {"mode": "mean", "value": None})
-        st["mode"] = enc.cob_reduce.currentData() or "mean"
-        st["value"] = enc.cob_reduce_val.currentData()
-        if kind == CURVES_X_AXIS and axis_i is not None:
-            dock.state.x_index = axis_i
-            self.build_plots_for_scan(scan, axis_i)
-        else:
-            dock.state.x_index = curve_i
-            self.build_plots_for_scan(scan, curve_i)
-        self._sync_dock_encoding_visibility(dock)
-        self._rebuild_dock_dim_bar(dock)
-        self._redraw_derived_dock(dock)
-
-    def _dock_matching_slices(self, dock, scan):
-        if scan.plots is None or not scan.plots.plots:
-            return []
-        kind, x_axis = self._dock_x_selection(dock)
-        fit_along = scan.plots.x_index
-        key_sets = scan.metadata.get("key_sets") or []
-        key_axis_indices = [i for i in range(len(key_sets)) if i != fit_along]
-        keys = list(scan.plots.plots.keys())
-        out = []
-        for si, key in enumerate(keys):
-            ok = True
-            for pos, ax in enumerate(key_axis_indices):
-                if kind == CURVES_X_AXIS and ax == x_axis:
-                    continue
-                st = dock.state.encoding_dim_state.get(f"axis:{ax}", {"mode": "one"})
-                if st.get("mode") == "all":
-                    continue
-                want = st.get("value")
-                if want is None or pos >= len(key):
-                    continue
-                if float(key[pos]) != float(want):
-                    ok = False
-                    break
-            if ok:
-                out.append(si)
-        return out if out else list(range(len(keys)))
-
-    def _dock_fit_pick(self, dock):
-        kind, _ = self._dock_x_selection(dock)
-        if kind not in (CURVES_X_ROI, CURVES_X_TIME):
-            return None
-        i = self._dock_curve_axis_index(dock)
-        st = dock.state.encoding_dim_state.get(f"fit:{i}", {"mode": "mean"})
-        if st.get("mode") == "one":
-            return st.get("value")
-        return None
-
-    def _open_derived_dock(self, scan, kind, title):
-        x_index = self.cob_x.currentIndex() if self.cob_x.count() else 0
-        self.build_plots_for_scan(scan, x_index)
-        pw = self._new_plot_widget()
-        dock = self.show_plot_dock(title, pw, kind=kind, floating=True)
-        dock.state.derived_scan = scan
-        dock.state.x_index = x_index
-        dock.state.slice = 0
-        src = self.curves_dock.state
-        dock.state.style = dict(src.style)
-        dock.state.show_legend = bool(src.show_legend)
-        dock.state.show_errorbars = bool(src.show_errorbars)
-        dock.state.fitfunc = src.fitfunc or self._curves_fitfunc()
-        # Seed encoding from Curves so Merge/Global starts with the same cube view
-        dock.state.encoding_dim_state = {
-            k: dict(v) for k, v in (self.curves_dim_state or {}).items()
-        }
-        kind_x, axis_x = self._curves_x_selection()
-        self._sync_dock_ctrls_from_state(dock)
-        self._populate_dock_encoding(dock)
-        # Restore Curves X selection on the derived dock
-        enc = getattr(dock, "enc_ctrls", None)
-        if enc is not None:
-            self.skip = True
-            target = (kind_x, axis_x if kind_x == CURVES_X_AXIS else None)
-            for i in range(enc.cob_x_dim.count()):
-                if enc.cob_x_dim.itemData(i) == target:
-                    enc.cob_x_dim.setCurrentIndex(i)
-                    break
-            self.skip = False
-            self._sync_dock_encoding_visibility(dock)
-            self._rebuild_dock_dim_bar(dock)
-        recipe = {
-            "type": kind,
-            "title": dock.windowTitle(),
-            "source_names": [scan.name],
-            "x_index": x_index,
-        }
-        self._record_tab_recipe(recipe, dock=dock)
-        self._redraw_derived_dock(dock)
-        return dock
 
     def _draw_roi_grid_scan_on_dock(self, dock):
         """ROI-grid Type for a dock with derived_scan (measurement Y layout)."""
@@ -7903,7 +6981,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not isinstance(pw, PlotWidget):
             return
         enc = dock.state.encoding or {}
-        # Prefer EncodingPanel (universal) over legacy enc_ctrls
         if getattr(dock, "encoding_panel", None) is not None:
             x_kind, axis_i = parse_dim_id(enc.get("x_dim") or "axis:0")
             curve_i = axis_i if x_kind == "axis" else 0
@@ -7928,14 +7005,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 if kind in (CURVES_X_ROI, CURVES_X_TIME)
                 else None
             )
-        elif getattr(dock, "enc_ctrls", None):
-            curve_i = self._dock_curve_axis_index(dock)
-            kind, _ = self._dock_x_selection(dock)
-            scan_idxs = list(range(len(all_scans)))
-            roi_idxs = None
-            slices = None
-            x_pick = self._dock_fit_pick(dock)
-            probe = all_scans[0]
         else:
             curve_i = dock.state.x_index or 0
             kind = CURVES_X_AXIS
@@ -7972,16 +7041,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 if not use_rois:
                     use_rois = [0] if n_rois else []
             if slices is None:
-                if getattr(dock, "enc_ctrls", None):
-                    use_slices = self._dock_matching_slices(dock, scan)
-                else:
-                    use_slices = [min(dock.state.slice or 0, max(n_plots - 1, 0))]
+                use_slices = [min(dock.state.slice or 0, max(n_plots - 1, 0))]
             else:
                 use_slices = [s for s in slices if 0 <= int(s) < n_plots]
                 if not use_slices and n_plots:
                     use_slices = [0]
-            if getattr(dock, "enc_ctrls", None) and x_pick is None:
-                x_pick = self._dock_fit_pick(dock)
 
             short = self._scan_short_name(scan)
 
@@ -8618,22 +7682,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if title and self._focused_dock is not None and self._focused_dock is not self.curves_dock:
             self._focused_dock.setWindowTitle(title)
             self._focused_dock.state.title = title
-
-    def copy_widget_to_clipboard(self, widget):
-        """Copy a QWidget grab to the Windows clipboard as a DIB."""
-        qimg = widget.grab().toImage().convertToFormat(QImage.Format.Format_RGBA8888)
-        ptr = qimg.bits()
-        ptr.setsize(qimg.sizeInBytes())
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(qimg.height(), qimg.width(), 4)
-        img = Image.fromarray(arr[:, :, :3].copy(), "RGB")
-        output = io.BytesIO()
-        img.save(output, "BMP")
-        data = output.getvalue()[14:]
-        output.close()
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
-        win32clipboard.CloseClipboard()
 
 class dummy:
     def __init__(self):

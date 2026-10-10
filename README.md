@@ -1,8 +1,8 @@
 # Data Processor / Scan Plot
 
-Standalone PyQt6 + pyqtgraph GUI for loading lab **scan folders**, overlaying curves, fitting, and saving named **experiment packages**.
+Standalone PyQt6 + pyqtgraph GUI for loading lab **scan folders**, overlaying curves, fitting, deriving reduced plots, and saving named **experiment packages**.
 
-**Primary entry:** [`scan_plot_standalone.py`](scan_plot_standalone.py) (~4k lines, single-file app).
+**Primary entry:** [`scan_plot_standalone.py`](scan_plot_standalone.py) (single-file app).
 
 This README is the handoff doc for **future AI agents**. Prefer small, localized changes; preserve data semantics and Qt slot patterns below. Do not invent a multi-package refactor unless the user asks.
 
@@ -20,6 +20,14 @@ python scan_plot_standalone.py
 - **Windows** assumed (`pywin32` clipboard DIB).
 - After code edits: **restart the GUI** (no hot reload).
 
+Headless regression:
+
+```bash
+conda activate lab_data_processor
+set QT_QPA_PLATFORM=offscreen
+python _smoke_test_universal.py
+```
+
 ---
 
 ## Repository layout
@@ -27,6 +35,7 @@ python scan_plot_standalone.py
 | Path | Role |
 |------|------|
 | `scan_plot_standalone.py` | Entire app: UI, loaders, fitters, experiments |
+| `_smoke_test_universal.py` | Offscreen regression for Encoding / Derive / Average |
 | `data/YYYY-MM-DD/scanHHMMSS/` | Raw scans (`log.csv` + `logResults.csv`) |
 | `experiments/*.zip` | Saved experiment packages (portable) |
 | `environment.yml` / `requirements.txt` | Runtime deps |
@@ -62,8 +71,8 @@ class ScanDataset:
 
 Built by `build_plots_for_scan(scan, x_index)`:
 
-- One axis index as **X** (`cob_x` on Curves dock).
-- Remaining axes → **slice keys** → scrollbar pages.
+- One axis index as **X**.
+- Remaining axes → **slice keys** → scrollbar pages (Curves).
 - Each slice: one `Plot` per ROI with raw `x`, `y`, optional fit + params.
 
 Plotting:
@@ -74,15 +83,15 @@ Plotting:
 
 ---
 
-## UI architecture (current)
+## UI architecture
 
 Layout: `ScanPlotApplet._rebuild_main_layout()`.
 
 - **No global Analyze toolbar.** Rename docks by **double-clicking the title bar**.
 - **Browser**: Import + Experiments only.
-- **Every plot** uses the same left sidebar template (Curves and floating Derive/Average docks).
+- **Every plot** uses the same left sidebar template (Curves and Derive/Average docks).
 
-Mental model: **one plot = one multidimensional dataset**. Import → Curves uses the raw cube. Same-plot ops change the view; Derive ops open a **new** same-template plot.
+Mental model: **one plot = one multidimensional dataset**. Import → Curves uses the raw cube. Same-plot ops change the view; Derive ops open a **new** same-template plot, **tabified with the source plot**.
 
 1. **Encoding**: Type (`XY` | `2D` | `ROI grid`) / axes / Dimensions
 2. **Derive**: Fit param… / Average… (new data → new plot)
@@ -99,66 +108,63 @@ Mental model: **one plot = one multidimensional dataset**. Import → Curves use
 ```
 
 - **Same plot**: Fit overlay, Style, Encoding Type/dims (no new dataset).
-- **New plot**: Derive → Fit param… or Average… (always same template via `_open_universal_plotter`).
+- **New plot**: Derive → Fit param… or Average… via `_open_universal_plotter` + `_attach_plot_dock_to_source` (tabify with source).
 
 ### Encoding Type
 
 | Type | What it draws | Dim rules |
 |------|---------------|-----------|
 | `XY` | Y vs one X dim | Other dims One/Multi/All/Mean |
-| `2D` | Heatmap of current Y vs two dims | Remaining dims **One** only |
-| `ROI grid` | Current Y laid out on ROI rows×cols (no auto-fit) | Other dims **One** only |
+| `2D` | Heatmap of current Y vs **any two** dims (axis / ROI / scan) | Remaining dims **One** only |
+| `ROI grid` | Current Y on ROI rows×cols | Other dims **One** only |
+
+### Dimensions catalog (source of truth)
+
+Each dock’s Encoding sidebar stores `encoding_panel._dim_catalog`.
+
+- Curves: built from `_cube_dim_catalog()` (axes + ROI + scan).
+- After **Average…** / **Fit param…**: new plot gets a **trimmed** catalog (`out_cat`). Collapsed dims (e.g. ROI after Avg ROI) must **not** reappear.
+- Dialogs (Average / Fit New X) and nested Average read `_dock_dim_catalog(dock)` — the sidebar catalog — **not** a rebuild from raw `scan.data` (that would resurrect ROI when only one ROI remains).
 
 ### Derive box
 
 | Action | Effect |
 |--------|--------|
-| **Fit param…** | Fit along current X → Y = one fit param → new universal plot |
-| **Average…** | Multi-select dims to average → reduced cube → new universal plot |
+| **Fit param…** | Fit along current X (any Analyze model) → Y = one fit param → new `derived_fit` plot. Fit-along dim is dropped from Dimensions. |
+| **Average…** | Multi-select dims → mean collapse → new plot. Works on **measurement cubes** (`derived_avg`) and on **Fit-param point plots** (average over ROI / scan / remaining axes; stays `derived_fit`). |
 
-### Per-dock control strip
-
-| Dock kind | Controls |
-|-----------|----------|
-| `curves`, `derived_fit`, `derived_avg` | Encoding + Derive + Style + Analyze (same template) |
-| `export`, `batch`, legacy `2d`/`heatmap` | Older chrome (not used by main Derive path) |
-
-Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`).
+Nested Average (e.g. ROI then scan) keeps only dims still present on the source catalog; axes come from the reduced cube’s `key_sets`.
 
 ### Defaults (`default_plot_style` / `PlotViewState`)
 
 - Style mode: **Scatter**
 - Legend: **on**
 - Error bars: **on**
-- Line width: **fixed 2** (no Width spinner in UI)
+- Line width: **fixed 2**
 
 ### `PlotViewState` (on each `PlotDock.state`)
 
 | Field | Role |
 |-------|------|
-| `kind` | `curves` \| `derived_fit` \| `derived_avg` \| `export` \| `2d` \| `heatmap` \| `batch` \| … |
-| `style` | `{mode, linewidth=2, symbol_size, show_errorbars}` |
-| `show_legend` / `show_errorbars` | View toggles |
+| `kind` | `curves` \| `derived_fit` \| `derived_avg` \| `export` \| `2d` \| `heatmap` \| `batch` |
+| `style` / `show_legend` / `show_errorbars` | View toggles |
 | `fitfunc` | Per-dock fit function name |
-| `cached_xy` | Snapshot curve `(x, y, heights, y_centers)` for Export / some Batch |
-| `fit_overlays` | Snapshot fit curves `{x,y,color}` — survive Style redraw |
-| `panel_series` | Batch vs-time multi-panel series (+ optional `fit_x`/`fit_y`) |
-| `derived_scan` | Reduced cube from Average… (or legacy merge/global) |
-| `encoding` | Universal plotter state: `{plot_type, x_dim, y_dim?, y_channel, dims}` |
-| `derived_points` | Fit-param points for Derive docks |
-| `encoding_dim_state` | Legacy bridge for older derived docks |
+| `cached_xy` / `fit_overlays` | Export / snapshot redraw |
+| `panel_series` | Batch vs-time multi-panel (+ optional `fit_x`/`fit_y`) |
+| `derived_scan` / `derived_scans` | Reduced measurement cube(s) from Average… |
+| `derived_points` | Fit-param points (`axis_vals` for later Average grouping) |
+| `encoding` | `{plot_type, x_dim, y_dim?, y_channel, dims}` |
 | `recipe` | Experiment persistence blob |
 
 ### Curves dock
 
-- `closable=False` — **no close button**; cannot be dismissed from UI.
-- Starts **hidden**; `import_data` → `_show_curves_dock()` + `_relayout_main_docks()`.
-- Central widget is 0×0 so Left/Right docks own the client area (avoids Curves as a thin left sliver).
+- `closable=False` — cannot be dismissed from UI.
+- Starts **hidden**; import → `_show_curves_dock()` + `_relayout_main_docks()`.
+- Central widget is 0×0 so Left/Right docks own the client area.
 
 ### Multi-scan overlay
 
 - `self.scans`: loaded scans only (derived docks are **not** listed).
-- `list_scans` × `list_roi` × scrollbar → `draw_plot()` on Curves.
 - Colors: `OVERLAY_COLORS`.
 - `primary_scan()` = first selected (or `scans[0]`).
 
@@ -171,54 +177,33 @@ Import: `ScanPickerDialog` with filter + sort (Name/Date).
 ### Theme
 
 - `APP_STYLESHEET` + `_style_plot_item`
-- Images: `_add_image_with_colorbar` → viridis + `ColorBarItem`
+- Images: viridis + `ColorBarItem`
 - Legend click toggles curve **and** linked `ErrorBarItem` (`link_curve_errorbar`)
 
 ---
 
 ## Analyze features
 
-Entry points live on the **Curves** dock (not a global toolbar). Fitfunc / Curve axis come from Curves.
-
-### Derive box vs Batch
-
-- **Fit param…**: fit along current Encoding X → one fit param → new universal plot (`derived_fit`).
-- **Average…**: pick dims → mean collapse → new universal plot (`derived_avg`).
-- **Batch fit** (legacy, UI hidden): still replayable from old experiment recipes.
-
-### ROI grid (Encoding Type `ROI grid`)
-
-- Lays out **current Y** on ROI rows×cols (`factor_roi_grid`). No auto-fit.
-- Other dims forced to One. Needs `n_rois ≥ 2`.
-- To grid a fit parameter: Fit param… first, then Type=`ROI grid` on the new plot.
-
-### 2D plot (Encoding Type `2D`)
-
-- Heatmap of current Y vs **two scan axes** from Encoding.
-- Remaining dims One. Not a fit-parameter map (use ROI grid after Derive).
-
-### Export / Copy
-
-- **Export**: binned curve → new Export dock + TSV; copies Curves style/fit prefs; `cached_xy` + optional `fit_overlays`.
-- **Copy ▾**:
-  - Copy image (Ctrl+C) — grabs dock widget
-  - Copy raw data (Ctrl+A) — TSV via `_dock_copy_raw`:
-    - snapshot → `x, y, yerr`
-    - Curves → all selected scan×ROI unbinned series
-    - derived → that dock’s scan
-    - Batch panels → side-by-side columns
-  - Status bar reports success/failure
-
 ### Fit (per dock)
 
 - Fit / Clear / function combo on **that** dock only (`_dock_fit` → `perform_fit(..., dock=)`).
-- Curves: fits live on `scan.plots`; redraw re-attaches.
-- Export/snapshot: `fit_overlays` reapplied after Style/Legend/Errorbars.
-- Derived: fits on `derived_scan.plots`; `_redraw_derived_dock` re-attaches.
-- Batch vs-time: `fit_x`/`fit_y` on `panel_series`; `_redraw_batch_panels`.
 - Right-click Fit → `FittingDialog` (guess/fixed params).
 - Guards: ≥2 finite points; `sanity_check_fit`; clipped fit y for autoRange.
-- `curve_fit` may still emit `OptimizeWarning` (covariance) on short/noisy series — data issue, not wiring.
+
+### Export / Copy
+
+- **Export**: binned curve → Export dock + TSV; copies style/fit prefs.
+- **Copy ▾**: image (Ctrl+C) / raw data (Ctrl+A) via `_dock_copy_raw`.
+
+### Legacy recipe-only paths (no main UI)
+
+Still reachable from **experiment zip replay** and/or **Ctrl+Q** (2D dialog):
+
+- `two_d_plot` + `TwoDPlotDialog`
+- `generate_heatmap` + `HeatmapDialog`
+- `batch_fit_selected` + `BatchAnalyzeDialog`
+
+Prefer Encoding Type=`2D` / `ROI grid` and Derive Fit param… for new work. Do not delete these until recipe migration is explicit.
 
 ---
 
@@ -249,7 +234,7 @@ Browser: list `experiments/*.zip`; Save / Load / Refresh; double-click load; RMB
 ```
 
 - Scans fully embedded (portable).
-- Recipes replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch`). **Derived merge/global not restored.**
+- Recipes replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch`). Old `derived_merge` / `derived_global` recipes are skipped.
 - v1 zips still load (no `dock_layout`).
 - Closing an analysis dock drops its recipe from `self.tab_recipes`.
 
@@ -273,11 +258,11 @@ if not isinstance(recipe, dict):
 
 ### Focus / ZOrderChange
 
-Do **not** listen to `ZOrderChange` on docks (focus storm). Focus via MouseButtonPress / WindowActivate + explicit `set_focused_dock` in dock control handlers.
+Do **not** listen to `ZOrderChange` on docks (focus storm). Focus via MouseButtonPress / WindowActivate + explicit `set_focused_dock`.
 
 ### Lambdas on dock controls
 
-Use default-arg capture: `lambda _=False, d=dock: self._dock_fit(d)` — never close over loop variable without default.
+Use default-arg capture: `lambda _=False, d=dock: self._dock_fit(d)`.
 
 ### No matplotlib plot windows
 
@@ -285,11 +270,11 @@ Secondary plots = pyqtgraph in `PlotDock`s only.
 
 ### Legacy UI chrome
 
-`Ui_MainWindow` still builds `cob_fit`, `bt_fit`, `cob_action`, etc. They are **hidden/unused**. Per-dock controls are the real UI. Prefer not re-wiring legacy widgets.
+`Ui_MainWindow` still builds some hidden widgets (`cob_x`, `cob_curves_x`, …) used as a **bridge** from Encoding → Curves draw (`_sync_legacy_from_encoding`). Do not delete those without rewiring draw paths.
 
-### Floating dock placement
+### New derived docks
 
-`_place_floating_dock` centers new floating docks over the main window (deferred with `QTimer.singleShot(0, …)`).
+`_attach_plot_dock_to_source` tabifies with the creating dock (or Curves). Prefer this over floating Right placement for Fit param / Average.
 
 ---
 
@@ -299,21 +284,15 @@ Secondary plots = pyqtgraph in `PlotDock`s only.
 |--------|---------|
 | `ScanPlotApplet` | Main window |
 | `PlotDock` / `PlotViewState` | Per-panel dock + state |
-| `_build_dock_control_bar` | Per-dock View/Style/Fit/Copy strip |
-| `_dock_fit` / `_dock_copy_raw` / `_redraw_dock` | Dock-scoped actions |
-| `_rebuild_main_layout` | Toolbar + docks + browser |
-| `show_plot_dock` | Open analysis/derived dock (`show_plot_tab` alias) |
-| `draw_plot` / `set_x` / `create_new_plot` | Curves rendering |
+| `EncodingPanel` / `DerivePanel` / `StylePanel` / `AnalyzePanel` | Sidebar template |
+| `_open_universal_plotter` / `_attach_plot_dock_to_source` | New Derive/Average docks |
+| `_dock_dim_catalog` | Dimensions available on a dock |
+| `derive_fit_param_plot` / `_compute_derive_points` | Fit-param Derive |
+| `average_cube_dims` / `_average_scans_over_dims` / `_average_derived_points_over_dims` | Average… |
+| `draw_plot` / `_redraw_universal_dock` / `_redraw_derived_dock` | Rendering |
 | `import_data` / `ScanPickerDialog` | Load scans |
-| `batch_fit_selected` / `BatchAnalyzeDialog` | Batch analyze |
-| `generate_heatmap` / `HeatmapDialog` | ROI heatmap |
-| `two_d_plot` | Slice stack image |
-| `merge_selected_scans` / `globalify` / `_open_derived_dock` | Derived docks |
 | `save_experiment` / `open_experiment` | Experiment zip I/O (v2) |
-| `_record_tab_recipe` / `_replay_tab_recipe` | Dock recipe persistence |
 | `Fitter` / `sanity_check_fit` | Curve fitting |
-
-Legacy still in file (cleanup candidates): `ParameterDialog`, hidden `cob_action` / old fit buttons.
 
 ---
 
@@ -321,33 +300,26 @@ Legacy still in file (cleanup candidates): `ParameterDialog`, hidden `cob_action
 
 Only do these if the user asks:
 
-1. Derived docks: no slice scrollbar; merge/global not embedded in experiment zip; Batch/2D/ROI grid not yet on derived docks.
+1. Embed Derive/Average docks fully in experiment zip (points + reduced cubes).
 2. Promote derived → Loaded scans (explicit action).
-3. Full encoding shelf (explicit Color/Y channels) — currently simplified presets.
-4. Batch vs-time: richer per-panel style; progress dialog for large fits.
-5. Import dialog virtualization (slow with ~10k scans).
-6. Title rename UX polish (double-click can feel flaky on some docks).
-7. Dead UI cleanup: `ParameterDialog`, unused `Ui_MainWindow` chrome.
-8. Optional module split if file size blocks work.
+3. Full encoding shelf (explicit Color/Y channels).
+4. Import dialog virtualization (slow with ~10k scans).
+5. Drop recipe+Ctrl+Q for legacy `two_d_plot` / heatmap / batch once unused.
+6. Optional module split if file size blocks work.
+7. Title rename UX polish.
 
 ---
 
 ## Verification habits
 
 1. Restart GUI after edits.
-2. Smoke: Import → Encoding XY Fit/Style → Type 2D → Type ROI grid → Derive Fit param… → Derive Average… → Export → Clear data → Load exp.
+2. Smoke: Import → Encoding XY Fit/Style → Type 2D → Type ROI grid → Fit param… → Average… (incl. on Fit plot) → nested Average → Export → Clear data → Load exp.
 3. Watch `TypeError: takes N positional arguments but M were given` on new button slots.
-4. Prefer `logging` with scan name + ROI; status bar for user-facing copy/fit results.
-
-Offscreen smoke pattern:
-
-```bash
-# conda activate lab_data_processor
-python -c "import os,sys; os.environ['QT_QPA_PLATFORM']='offscreen'; ..."
-```
+4. Prefer `logging` with scan name + ROI; status bar for user-facing results.
+5. Run `_smoke_test_universal.py` offscreen after Derive/Average/Encoding changes.
 
 ---
 
 ## Origin
 
-Related historically to ARTIQ scan applets (commented `SimpleApplet` / RPC). This tool analyzes exported CSV pairs offline for lab presentation and multi-day comparison.
+Related historically to ARTIQ scan applets. This tool analyzes exported CSV pairs offline for lab presentation and multi-day comparison.
