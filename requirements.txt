@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+pillow
+pywin32
+statsmodels
+scikit-image
+PyQt6
+pyqtgraph

@@ -1,0 +1,17 @@
+name: lab_data_processor
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    # All runtime deps via pip to avoid conda Qt5/Qt6 solver conflicts on Windows
+    - numpy
+    - scipy
+    - matplotlib
+    - pillow
+    - pywin32
+    - statsmodels
+    - scikit-image
+    - PyQt6
+    - pyqtgraph
