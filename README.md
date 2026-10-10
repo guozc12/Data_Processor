@@ -79,36 +79,49 @@ Plotting:
 Layout: `ScanPlotApplet._rebuild_main_layout()`.
 
 - **No global Analyze toolbar.** Rename docks by **double-clicking the title bar**.
-- **Browser**: Import, Refresh all, Merge/Global/Clear, Experiments. (No Loaded-scans / ROI lists — both live in the plot Encoding panel.)
-- **View / Style / Fit / analyze** are per-plot, in the left sidebar of Curves.
+- **Browser**: Import + Experiments only.
+- **Every plot** uses the same left sidebar template (Curves and floating Derive/Average docks).
 
-Mental model: after Import, selected scans form a **cube** (native scan axes × **ROI** × **scan**). Each plot dock is a **universal plotter**:
+Mental model: **one plot = one multidimensional dataset**. Import → Curves uses the raw cube. Same-plot ops change the view; Derive ops open a **new** same-template plot.
 
-1. **Encoding** (left): Type (XY) / X / Y / Dimensions (One·Multi·All·Mean)
-2. **Style** (left): Legend, Error bars, Mode
-3. **Analyze** (left): Fit, Derive, legacy 2D/Batch/ROI grid/Export, Copy
+1. **Encoding**: Type (`XY` | `2D` | `ROI grid`) / axes / Dimensions
+2. **Derive**: Fit param… / Average… (new data → new plot)
+3. **Style**: Legend, Error bars, Mode
+4. **Analyze**: Fit / Clear fit / Export / Copy / Clear data…
 
 ```
-┌─ Curves ──────────────────────────────┬─ Browser ─────────────┤
+┌─ Curves (or any plot) ────────────────┬─ Browser ─────────────┤
 │ Encoding │ plot                         │ Data: Import          │
-│ Style    │                              │       Refresh all     │
-│ Analyze  │                              │       Merge/Global    │
-│          │                              │ Experiments           │
+│ Derive   │                              │ Experiments           │
+│ Style    │                              │                       │
+│ Analyze  │                              │                       │
 └────────────────────────────────────────┴───────────────────────┘
 ```
 
-- Plot **encoding** (not Browser ROI) is the source of truth for what is drawn.
-- **Refresh all** re-runs legacy analysis docks from recipes with current context. Experiment Load still restores frozen context.
+- **Same plot**: Fit overlay, Style, Encoding Type/dims (no new dataset).
+- **New plot**: Derive → Fit param… or Average… (always same template via `_open_universal_plotter`).
+
+### Encoding Type
+
+| Type | What it draws | Dim rules |
+|------|---------------|-----------|
+| `XY` | Y vs one X dim | Other dims One/Multi/All/Mean |
+| `2D` | Heatmap of current Y vs two dims | Remaining dims **One** only |
+| `ROI grid` | Current Y laid out on ROI rows×cols (no auto-fit) | Other dims **One** only |
+
+### Derive box
+
+| Action | Effect |
+|--------|--------|
+| **Fit param…** | Fit along current X → Y = one fit param → new universal plot |
+| **Average…** | Multi-select dims to average → reduced cube → new universal plot |
 
 ### Per-dock control strip
 
 | Dock kind | Controls |
 |-----------|----------|
-| `curves` | `EncodingPanel` (Type/X/Dimensions incl. ROI+scan) + Legend, Style, Fit, Clear, **Derive**, 2D, Batch fit, ROI grid, Export, Copy |
-| Derive (fit-param) | Same `EncodingPanel` (Y = one fit param) + Style/Fit/Copy |
-| `derived_merge`, `derived_global` | Style/Fit/Copy (+ legacy encoding path may remain) |
-| `export`, `batch` | Legend, Error bars, Style, Fit, Clear fit, Copy |
-| `2d`, `heatmap` (ROI grid) | Copy only |
+| `curves`, `derived_fit`, `derived_avg` | Encoding + Derive + Style + Analyze (same template) |
+| `export`, `batch`, legacy `2d`/`heatmap` | Older chrome (not used by main Derive path) |
 
 Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`).
 
@@ -123,15 +136,15 @@ Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`).
 
 | Field | Role |
 |-------|------|
-| `kind` | `curves` \| `export` \| `2d` \| `heatmap` \| `batch` \| `derived_merge` \| `derived_global` |
+| `kind` | `curves` \| `derived_fit` \| `derived_avg` \| `export` \| `2d` \| `heatmap` \| `batch` \| … |
 | `style` | `{mode, linewidth=2, symbol_size, show_errorbars}` |
 | `show_legend` / `show_errorbars` | View toggles |
 | `fitfunc` | Per-dock fit function name |
 | `cached_xy` | Snapshot curve `(x, y, heights, y_centers)` for Export / some Batch |
 | `fit_overlays` | Snapshot fit curves `{x,y,color}` — survive Style redraw |
 | `panel_series` | Batch vs-time multi-panel series (+ optional `fit_x`/`fit_y`) |
-| `derived_scan` | Non-destructive Merge/Global dataset |
-| `encoding` | Universal plotter state: `{plot_type, x_dim, y_channel, dims}` |
+| `derived_scan` | Reduced cube from Average… (or legacy merge/global) |
+| `encoding` | Universal plotter state: `{plot_type, x_dim, y_dim?, y_channel, dims}` |
 | `derived_points` | Fit-param points for Derive docks |
 | `encoding_dim_state` | Legacy bridge for older derived docks |
 | `recipe` | Experiment persistence blob |
@@ -149,13 +162,9 @@ Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`).
 - Colors: `OVERLAY_COLORS`.
 - `primary_scan()` = first selected (or `scans[0]`).
 
-### Merge / Global / Clear (Loaded scans RMB)
+### Clear data…
 
-| Action | Effect |
-|--------|--------|
-| **Merge** (≥2) | Floating `derived_merge` dock; originals untouched; not in Loaded scans |
-| **Global** | Floating `derived_global` (sum ROIs); non-destructive |
-| **Clear all…** | Confirm → clear scans + close analysis docks |
+Analyze → **Clear data…**: confirm → wipe loaded scans and close analysis docks.
 
 Import: `ScanPickerDialog` with filter + sort (Name/Date).
 
@@ -171,27 +180,22 @@ Import: `ScanPickerDialog` with filter + sort (Name/Date).
 
 Entry points live on the **Curves** dock (not a global toolbar). Fitfunc / Curve axis come from Curves.
 
-### Batch fit (`BatchAnalyzeDialog`)
+### Derive box vs Batch
 
-Choose **outer dimension** (replaces old mode radios):
+- **Fit param…**: fit along current Encoding X → one fit param → new universal plot (`derived_fit`).
+- **Average…**: pick dims → mean collapse → new universal plot (`derived_avg`).
+- **Batch fit** (legacy, UI hidden): still replayable from old experiment recipes.
 
-| Outer | Behavior |
-|------|----------|
-| `scan time` | Fit selected scans×selected ROIs @ slice; params vs time (`panel_series`) |
-| `ROI (all)` | One scan; fit **all** ROIs; param vs ROI index |
-| scan axis A | One scan; fit along Curve axis; param vs axis A (other axes fixed to current slice) |
+### ROI grid (Encoding Type `ROI grid`)
 
-### ROI grid (kind `heatmap`)
+- Lays out **current Y** on ROI rows×cols (`factor_roi_grid`). No auto-fit.
+- Other dims forced to One. Needs `n_rois ≥ 2`.
+- To grid a fit parameter: Fit param… first, then Type=`ROI grid` on the new plot.
 
-- Same reduce as Batch outer=ROI, displayed as rows×cols color grid (preserves array layout).
-- Always **all ROIs**; needs `n_rois ≥ 2`.
-- Failed ROI fits → NaN cells.
+### 2D plot (Encoding Type `2D`)
 
-### 2D plot (scan axes)
-
-- Measurement value (same binning as Curves) vs **two user-chosen scan axes**.
-- One scan × one ROI; axes beyond X/Y fixed to the current Curves slice.
-- Not a fit-parameter map (that is ROI grid).
+- Heatmap of current Y vs **two scan axes** from Encoding.
+- Remaining dims One. Not a fit-parameter map (use ROI grid after Derive).
 
 ### Export / Copy
 
@@ -331,7 +335,7 @@ Only do these if the user asks:
 ## Verification habits
 
 1. Restart GUI after edits.
-2. Smoke: Import → Curves Fit/Style → Export Fit + restyle (fit must stay) → Copy raw → Batch (3 modes) → Heatmap → Merge/Global → Save exp → Clear → Load exp.
+2. Smoke: Import → Encoding XY Fit/Style → Type 2D → Type ROI grid → Derive Fit param… → Derive Average… → Export → Clear data → Load exp.
 3. Watch `TypeError: takes N positional arguments but M were given` on new button slots.
 4. Prefer `logging` with scan name + ROI; status bar for user-facing copy/fit results.
 
