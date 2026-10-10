@@ -87,44 +87,45 @@ Empty / all-NaN ROI bins are skipped when drawing (avoid All-NaN crashes).
 
 ## UI architecture
 
-Layout is rebuilt in `ScanPlotApplet._rebuild_main_layout()` (overrides generated `Ui_MainWindow` grid).
+Layout is rebuilt in `ScanPlotApplet._rebuild_main_layout()`. All plot panels are **`PlotDock` (`QDockWidget`)** — including Curves (C2). Browser (Experiments / Loaded scans / ROI) is also a dock.
 
 ```
-┌─ Top toolbar ─────────────────────────────────────────────────────────┐
-│ Data: Import | Clear scans | Merge | Global                           │
-│ View: X combo | Show legend | 2D plot | Export | Copy▾                │
-│ Fit:  fitfunc | Fit | Clear fit                                       │
-│ Analyze: Heatmap | Batch fit                                          │
-├──────────────────────────────┬────────────────────────────────────────┤
-│ plot_tabs                    │ Right panel (splitter)                 │
-│  [Curves] [Export] [2D] …    │  Experiments (list + Name + Save/Load) │
-│  Curves = pyqtgraph pw_plot  │  Loaded scans (multi-select)           │
-│  + scrollbar + lb_fit        │  ROI multi-select                      │
-└──────────────────────────────┴────────────────────────────────────────┘
+┌─ QToolBar: Data (Import) | Analyze (Heatmap, Batch fit) ───────────────────────────────────┐
+├─ PlotDocks (each has its own View/Style/Fit strip) ───────────────┬─ Browser dock ────────┤
+│ Curves (permanent, closable=False; shown after Import)             │ Experiments           │
+│   [X | Legend | Error bars | Style | Fit | 2D | Export | Copy]     │ Loaded scans (RMB)    │
+│ Export / Batch / Derived — same strip (floats with the dock)       │ ROI multi-select      │
+│ 2D / Heatmap — Copy only                                           │                       │
+└────────────────────────────────────────────────────────────────────┴───────────────────────┘
 ```
 
-### Plot tabs
+### Plot docks
 
-- Tab 0 **Curves** is permanent (close button removed).
-- Analysis plots open as **closable** tabs via `show_plot_tab(title, widget)`.
-- Style must match Curves: dark pyqtgraph axes (`_style_plot_item`), not matplotlib popups.
-- Images (2D / Heatmap): `_add_image_with_colorbar` → `viridis` LUT + `ColorBarItem` in col=1.
+- **Curves**: permanent (`closable=False`); hidden until Import, then always present. Rename any dock by double-clicking its title.
+- Analysis / derived: `show_plot_dock(title, widget, kind=…)` (alias `show_plot_tab` kept).
+- Per-dock `PlotViewState`: style (`Scatter` / `Line` / `Line+marker`; line width fixed at 2), legend, errorbars, fit function.
+- **View / Style / Fit controls live inside each plot dock** (`_build_dock_control_bar`) and move with float/dock — not on the main toolbar.
+- Dark theme: `APP_STYLESHEET` + `_style_plot_item` (subtle grid; teal/orange/sky/lavender).
+- Images (2D / Heatmap): `_add_image_with_colorbar` → `viridis` + `ColorBarItem`.
+- Legend click toggles curve **and** linked `ErrorBarItem` (`link_curve_errorbar`).
 
 ### Multi-scan overlay
 
-- `self.scans`: list of loaded `ScanDataset`
-- Selection in `list_scans` × `list_roi` × scrollbar slice → `draw_plot()`
-- Legend: auto if ≤4 series, or forced by **Show legend**
+- `self.scans`: loaded `ScanDataset` only (derived results are **not** listed here)
+- Selection in `list_scans` × `list_roi` × scrollbar → `draw_plot()` on Curves dock
 - Colors: `OVERLAY_COLORS`
 
-`primary_scan()` = first selected scan (or scans[0]). Many analyze paths historically used primary only; Heatmap now has an explicit scan picker.
+`primary_scan()` = first selected scan (or scans[0]).
 
-### Merge vs Global (do not confuse)
+### Merge vs Global (Loaded scans context menu)
 
 | Action | Scope | Effect |
 |--------|--------|--------|
-| **Merge** | ≥2 selected scans | Concatenate `points`+`data` into a new `merged_…` scan; originals kept. Requires matching `key_sets`, `function`, ROI count. |
-| **Global** | Primary scan | Sum all ROIs into one channel; **rewrites** that scan’s `data` (destructive). Renames function to `Global …`. |
+| **Merge** | ≥2 selected scans | Concatenate into a temporary dataset; open floating `derived_merge` dock. Originals untouched; **not** added to Loaded scans. |
+| **Global** | Primary scan | Deep-copy + sum ROIs; open floating `derived_global` dock. **Non-destructive**. |
+| **Clear all…** | All loaded | Confirm, then clear scans + close analysis docks. |
+
+Import dialog: filter substring + sort by Name/Date.
 
 ---
 
@@ -155,25 +156,27 @@ Implementation: `batch_fit_selected` → `_plot_param_scatter` for axis/ROI mode
 
 ### Export / Copy
 
-- **Export**: binned curve + optional fit → new tab + TSV clipboard.
-- **Copy▾**: image (Ctrl+C) or raw x,y (Ctrl+A).
+- **Export**: binned curve + optional fit → new **dock** + TSV clipboard (`cached_xy` for re-style/fit).
+- **Copy▾**: focused dock image (Ctrl+C) or raw x,y (Ctrl+A).
 
 ### Fit
 
 - `Fitter.func_dict`: Gauss, Lorentz, Sine, DampSine, Exp_decay, polynomials, …
-- `perform_fit` on applet: fits **all selected scan×ROI** overlays.
+- Fit button / Clear fit / function combo on **that dock’s** control strip; acts on that dock only.
+- Image docks (2D/Heatmap): no Fit controls (Copy only).
 - Right-click Fit → `FittingDialog` (advanced / fixed params).
-- Guard: `Fitter.perform_fit` requires ≥2 finite points.
+- Guards: ≥2 finite points; `sanity_check_fit` rejects extreme amp/width/freq; fit y clipped so autoRange is not blown out.
 
 ---
 
 ## Experiments (save / load)
 
-Right panel **Experiments** (above Loaded scans):
+Browser dock **Experiments**:
 
 - List = `experiments/*.zip`
 - Name field + **Save** / **Load** / **Refresh**
-- Double-click list item → Load
+- Double-click → Load
+- Right-click: Open / Duplicate / Delete / Reveal in folder / Refresh
 
 ### Package format (`experiments/<name>.zip`)
 
@@ -181,7 +184,7 @@ Contains single file `experiment.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "name": "...",
   "saved_at": "...",
   "ui": {
@@ -189,19 +192,22 @@ Contains single file `experiment.json`:
     "fitfunc": "Gauss",
     "slice": 0,
     "legend": false,
+    "style": {"mode": "Line+marker", "linewidth": 1.5},
     "scan_sel_names": ["2026-10-10\\scan000148"],
     "roi_sel": [7, 11]
   },
   "scans": [
     { "name": "...", "path": "...", "metadata": {...}, "data": [...] }
   ],
-  "tabs": [ /* tab recipes */ ]
+  "tabs": [ /* dock recipes */ ],
+  "dock_layout": "<base64 QMainWindow.saveState>"
 }
 ```
 
 - Scans are **fully embedded** (portable zip; does not require original `data/` tree).
-- Analysis tabs are **not** serialized as widgets; stored as **recipes** and replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch`).
-- `self.tab_recipes` is updated when opening analysis tabs; closing a tab pops the matching recipe index (`tab_index - 1`).
+- Analysis docks stored as **recipes** and replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch`). Derived merge/global recipes are skipped on load (not embedded).
+- `dock_layout` restores dock geometry when present (v2). **v1** zips still load (recipes only, default layout).
+- Closing an analysis dock removes its recipe from `self.tab_recipes`.
 
 After Load, window title becomes `Scan Plot — <name>`.
 
@@ -233,7 +239,7 @@ Narrow `(self)`-only slots are fine; PyQt drops extras when the signature has no
 
 ### Do not reintroduce matplotlib plot windows
 
-All secondary plots must use pyqtgraph widgets in `plot_tabs`. Matplotlib may still appear as a transitive dep; Prefer not to add `plt.show()` / `FigureCanvas` popups.
+All secondary plots must use pyqtgraph widgets in `PlotDock`s. Matplotlib may still appear as a transitive dep; Prefer not to add `plt.show()` / `FigureCanvas` popups.
 
 ### Generated UI dead widgets
 
@@ -246,16 +252,19 @@ All secondary plots must use pyqtgraph widgets in `plot_tabs`. Matplotlib may st
 | Symbol | Purpose |
 |--------|---------|
 | `ScanPlotApplet` | Main window |
-| `_rebuild_main_layout` | Toolbar + tabs + right panel |
+| `PlotDock` / `PlotViewState` | Per-panel dock + style/fit state |
+| `_rebuild_main_layout` | Toolbar + docks + browser |
+| `show_plot_dock` | Open analysis/derived dock |
 | `draw_plot` / `create_new_plot` / `set_x` | Curves rendering |
-| `import_data` / `ScanPickerDialog` | Load scans from `FOLDER` |
+| `import_data` / `ScanPickerDialog` | Load scans (filter/sort) |
 | `batch_fit_selected` / `BatchAnalyzeDialog` | Unified analyze |
 | `generate_heatmap` / `HeatmapDialog` | ROI grid heatmap |
 | `two_d_plot` | Slice stack image |
-| `save_experiment` / `open_experiment` / `refresh_experiment_list` | Experiment zip I/O |
-| `_record_tab_recipe` / `_replay_tab_recipe` | Tab persistence |
+| `merge_selected_scans` / `globalify` | Derived floating docks |
+| `save_experiment` / `open_experiment` | Experiment zip I/O (v2) |
+| `_record_tab_recipe` / `_replay_tab_recipe` | Dock recipe persistence |
 | `_add_image_with_colorbar` | Shared image + viridis bar |
-| `Fitter` | Curve fitting library |
+| `Fitter` / `sanity_check_fit` | Curve fitting + extreme reject |
 
 Unused / legacy still in file (safe to delete in a cleanup PR): `ParameterDialog` (superseded by Batch analyze modes).
 
@@ -266,11 +275,11 @@ Unused / legacy still in file (safe to delete in a cleanup PR): `ParameterDialog
 Prioritize only what the user requests; these are known gaps:
 
 1. **2D / Export multi-scan**: currently primary-centric; may need scan picker like Heatmap.
-2. **Experiment UX**: delete zip from UI; export/import zip from arbitrary path; progress bar on large embeds.
-3. **Global undo**: Global is destructive; soft-copy before mutate.
-4. **Performance**: batch-fitting many scans×ROIs is serial; consider progress dialog / skip empty ROIs earlier.
+2. **Embed derived docks** in experiment zip (merge/global currently skipped on load).
+3. **Promote derived → Loaded scans** (explicit user action).
+4. **Performance**: batch-fitting many scans×ROIs is serial; progress dialog.
 5. **Split module**: extract loaders / Fitter / dialogs only if file size blocks work.
-6. **Tests**: no automated GUI suite; smoke via headless `QApplication` + mocked dialogs (see past agent sessions).
+6. **Tests**: expand offscreen smoke beyond init + Gauss fit.
 7. **Remove dead UI**: `cob_action`, unused `ParameterDialog`, leftover matplotlib if unused.
 8. **Heatmap grid**: auto-suggest rows/cols from ROI count; validate before fit loop.
 
