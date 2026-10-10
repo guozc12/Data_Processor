@@ -78,29 +78,39 @@ Plotting:
 
 Layout: `ScanPlotApplet._rebuild_main_layout()`.
 
-- **No menu bar View menu** (removed). Rename docks by **double-clicking the title bar**.
-- Main toolbar: **Data → Import** | **Analyze → Heatmap, Batch fit** only.
-- **View / Style / Fit are per-plot**, inside each `PlotDock` (`_build_dock_control_bar`), and float/dock with that window.
+- **No global Analyze toolbar.** Rename docks by **double-clicking the title bar**.
+- **Browser**: Import, Refresh all, Merge/Global/Clear, Experiments. (No Loaded-scans / ROI lists — both live in the plot Encoding panel.)
+- **View / Style / Fit / analyze** are per-plot, in the left sidebar of Curves.
+
+Mental model: after Import, selected scans form a **cube** (native scan axes × **ROI** × **scan**). Each plot dock is a **universal plotter**:
+
+1. **Encoding** (left): Type (XY) / X / Y / Dimensions (One·Multi·All·Mean)
+2. **Style** (left): Legend, Error bars, Mode
+3. **Analyze** (left): Fit, Derive, legacy 2D/Batch/ROI grid/Export, Copy
 
 ```
-┌─ Toolbar: Data (Import) | Analyze (Heatmap, Batch fit) ───────────────────────────────────┐
-├─ Plot docks (each has its own control strip) ─────────────────────┬─ Browser dock ────────┤
-│ Curves (closable=False; hidden until Import, then always on)       │ Experiments           │
-│   [X | Legend | Error bars | Style | Fit | Clear | 2D | Export | Copy]                    │
-│ Export / Batch / Merge / Global — Style + Fit + Copy               │ Loaded scans (RMB)    │
-│ 2D / Heatmap — Copy only                                           │ ROI multi-select      │
-└────────────────────────────────────────────────────────────────────┴───────────────────────┘
+┌─ Curves ──────────────────────────────┬─ Browser ─────────────┤
+│ Encoding │ plot                         │ Data: Import          │
+│ Style    │                              │       Refresh all     │
+│ Analyze  │                              │       Merge/Global    │
+│          │                              │ Experiments           │
+└────────────────────────────────────────┴───────────────────────┘
 ```
+
+- Plot **encoding** (not Browser ROI) is the source of truth for what is drawn.
+- **Refresh all** re-runs legacy analysis docks from recipes with current context. Experiment Load still restores frozen context.
 
 ### Per-dock control strip
 
 | Dock kind | Controls |
 |-----------|----------|
-| `curves` | X, Legend, Error bars, Style, Fit func, Fit, Clear fit, 2D, Export, Copy |
-| `export`, `batch`, `derived_merge`, `derived_global` | Legend, Error bars, Style, Fit, Clear fit, Copy |
-| `2d`, `heatmap` | Copy only |
+| `curves` | `EncodingPanel` (Type/X/Dimensions incl. ROI+scan) + Legend, Style, Fit, Clear, **Derive**, 2D, Batch fit, ROI grid, Export, Copy |
+| Derive (fit-param) | Same `EncodingPanel` (Y = one fit param) + Style/Fit/Copy |
+| `derived_merge`, `derived_global` | Style/Fit/Copy (+ legacy encoding path may remain) |
+| `export`, `batch` | Legend, Error bars, Style, Fit, Clear fit, Copy |
+| `2d`, `heatmap` (ROI grid) | Copy only |
 
-Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`) — do not route Fit/Style through a global toolbar.
+Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`).
 
 ### Defaults (`default_plot_style` / `PlotViewState`)
 
@@ -121,6 +131,9 @@ Handlers bind the **dock object** explicitly (`lambda …, d=dock: …`) — do 
 | `fit_overlays` | Snapshot fit curves `{x,y,color}` — survive Style redraw |
 | `panel_series` | Batch vs-time multi-panel series (+ optional `fit_x`/`fit_y`) |
 | `derived_scan` | Non-destructive Merge/Global dataset |
+| `encoding` | Universal plotter state: `{plot_type, x_dim, y_channel, dims}` |
+| `derived_points` | Fit-param points for Derive docks |
+| `encoding_dim_state` | Legacy bridge for older derived docks |
 | `recipe` | Experiment persistence blob |
 
 ### Curves dock
@@ -156,25 +169,29 @@ Import: `ScanPickerDialog` with filter + sort (Name/Date).
 
 ## Analyze features
 
+Entry points live on the **Curves** dock (not a global toolbar). Fitfunc / Curve axis come from Curves.
+
 ### Batch fit (`BatchAnalyzeDialog`)
 
-| Mode | Behavior |
+Choose **outer dimension** (replaces old mode radios):
+
+| Outer | Behavior |
 |------|----------|
-| `vs_time` | Fit selected scans×ROIs @ slice; params vs scan time (`DateAxisItem` when parseable); stores `panel_series` |
-| `vs_axis` | One scan; param vs secondary axis → `cached_xy` dock |
-| `vs_ROI` | One scan; param vs ROIs → `cached_xy` dock |
+| `scan time` | Fit selected scans×selected ROIs @ slice; params vs time (`panel_series`) |
+| `ROI (all)` | One scan; fit **all** ROIs; param vs ROI index |
+| scan axis A | One scan; fit along Curve axis; param vs axis A (other axes fixed to current slice) |
 
-Entry: `batch_fit_selected`. Dialog default fitfunc from Curves (`_curves_fitfunc`).
+### ROI grid (kind `heatmap`)
 
-### Heatmap
-
-- Pick scan among selection, fit parameter, rows×cols (= ROI count).
+- Same reduce as Batch outer=ROI, displayed as rows×cols color grid (preserves array layout).
+- Always **all ROIs**; needs `n_rois ≥ 2`.
 - Failed ROI fits → NaN cells.
 
-### 2D plot
+### 2D plot (scan axes)
 
-- ≥2D scans: stack scrollbar slices into an image.
-- Primary-selection path only; multi-scan 2D not implemented.
+- Measurement value (same binning as Curves) vs **two user-chosen scan axes**.
+- One scan × one ROI; axes beyond X/Y fixed to the current Curves slice.
+- Not a fit-parameter map (that is ROI grid).
 
 ### Export / Copy
 
@@ -300,9 +317,9 @@ Legacy still in file (cleanup candidates): `ParameterDialog`, hidden `cob_action
 
 Only do these if the user asks:
 
-1. Derived docks: no slice scrollbar; merge/global not embedded in experiment zip.
+1. Derived docks: no slice scrollbar; merge/global not embedded in experiment zip; Batch/2D/ROI grid not yet on derived docks.
 2. Promote derived → Loaded scans (explicit action).
-3. 2D / Export multi-scan picker (currently primary-centric).
+3. Full encoding shelf (explicit Color/Y channels) — currently simplified presets.
 4. Batch vs-time: richer per-panel style; progress dialog for large fits.
 5. Import dialog virtualization (slow with ~10k scans).
 6. Title rename UX polish (double-click can feel flaky on some docks).
