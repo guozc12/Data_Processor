@@ -26,10 +26,16 @@ from PyQt6.QtWidgets import (
     QMainWindow, QDialog, QFileDialog, QApplication,
     QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QWidget,
+    QSplitter, QCheckBox, QFrame, QSizePolicy, QTabWidget,
+    QToolButton, QMenu, QInputDialog, QMessageBox, QRadioButton,
+    QButtonGroup, QLineEdit,
 )
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QImage, QAction
 from PyQt6.QtCore import Qt
-from pyqtgraph import ErrorBarItem, mkPen
+from pyqtgraph import (
+    ErrorBarItem, mkPen, PlotWidget, ImageItem, ColorBarItem,
+    GraphicsLayoutWidget, DateAxisItem, colormap as pg_colormap,
+)
 
 import numpy as np
 from scipy.stats import sem
@@ -40,6 +46,10 @@ import logging
 import io
 import re
 import copy
+import json
+import zipfile
+import tempfile
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -50,9 +60,9 @@ from PIL import Image
 # from artiq.applets.simple import SimpleApplet
 # from sipyco.pc_rpc import Client
 
-import matplotlib.pyplot as plt
-
-FOLDER = Path(__file__).resolve().parent / "data"
+ROOT = Path(__file__).resolve().parent
+FOLDER = ROOT / "data"
+EXPERIMENTS_DIR = ROOT / "experiments"
 style_sheet = {"pen": None, "symbol": "o", "symbolPen": None, "symbolBrush": (31, 120, 180)}
 font = {"font-size": "18px", "color": "#C8C8C8"}
 
@@ -393,62 +403,150 @@ class ParameterDialog(QDialog):
     def get_values(self):
         return self.cob_fit.currentIndex(), self.x_combo.currentIndex()
 
+
+class BatchAnalyzeDialog(QDialog):
+    """Batch fit / Fit-param modes: vs time, vs scan axis, vs ROI."""
+
+    MODE_TIME = "vs_time"
+    MODE_AXIS = "vs_axis"
+    MODE_ROI = "vs_ROI"
+
+    def __init__(self, param_names, scan_labels, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch analyze")
+        self.setModal(True)
+        self.resize(380, 420)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("X axis mode:"))
+        self._mode_group = QButtonGroup(self)
+        self.rb_time = QRadioButton("vs scan time (all selected scans)")
+        self.rb_axis = QRadioButton("vs secondary scan axis (one scan)")
+        self.rb_roi = QRadioButton("vs ROI (one scan, current slice)")
+        self.rb_time.setChecked(True)
+        for i, rb in enumerate((self.rb_time, self.rb_axis, self.rb_roi)):
+            self._mode_group.addButton(rb, i)
+            layout.addWidget(rb)
+
+        scan_row = QHBoxLayout()
+        scan_row.addWidget(QLabel("Target scan (axis / ROI modes):"))
+        self.cob_scan = QComboBox()
+        self.cob_scan.addItems(scan_labels or ["(none)"])
+        self.cob_scan.setEnabled(bool(scan_labels))
+        scan_row.addWidget(self.cob_scan, stretch=1)
+        layout.addLayout(scan_row)
+
+        def _sync_scan_enabled():
+            self.cob_scan.setEnabled(
+                (self.rb_axis.isChecked() or self.rb_roi.isChecked()) and bool(scan_labels)
+            )
+        self.rb_time.toggled.connect(_sync_scan_enabled)
+        self.rb_axis.toggled.connect(_sync_scan_enabled)
+        self.rb_roi.toggled.connect(_sync_scan_enabled)
+        _sync_scan_enabled()
+
+        layout.addWidget(QLabel("Parameters to plot:"))
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        for name in param_names:
+            item = QListWidgetItem(name)
+            self.list_widget.addItem(item)
+            item.setSelected(True)
+        layout.addWidget(self.list_widget)
+
+        sel_row = QHBoxLayout()
+        all_btn = QPushButton("Select all")
+        all_btn.clicked.connect(self.select_all)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.list_widget.clearSelection)
+        sel_row.addWidget(all_btn)
+        sel_row.addWidget(clear_btn)
+        sel_row.addStretch(1)
+        layout.addLayout(sel_row)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch(1)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def select_all(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setSelected(True)
+
+    def selected_params(self):
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+    def selected_mode(self):
+        if self.rb_axis.isChecked():
+            return self.MODE_AXIS
+        if self.rb_roi.isChecked():
+            return self.MODE_ROI
+        return self.MODE_TIME
+
+    def selected_scan_index(self):
+        """Index into the scan_labels list passed to __init__ (0-based)."""
+        return max(0, self.cob_scan.currentIndex())
+
+
 from PyQt6.QtWidgets import QLineEdit
 from PyQt6.QtGui import QIntValidator
+
+
 class HeatmapDialog(QDialog):
-    def __init__(self, fit_options, n_rois, parent=None):
+    def __init__(self, fit_options, n_rois, scan_labels=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Generate Heatmap")
         self.setModal(True)
 
         main_layout = QVBoxLayout()
 
-        # --- First row: Fit parameter + N_rois ---
-        top_layout = QHBoxLayout()
+        scan_labels = scan_labels or []
+        scan_row = QHBoxLayout()
+        scan_row.addWidget(QLabel("Scan:"))
+        self.cob_scan = QComboBox()
+        self.cob_scan.addItems(scan_labels if scan_labels else ["(none)"])
+        self.cob_scan.setEnabled(bool(scan_labels))
+        scan_row.addWidget(self.cob_scan, stretch=1)
+        main_layout.addLayout(scan_row)
 
+        top_layout = QHBoxLayout()
         top_layout.addWidget(QLabel("Fit parameter:"))
         self.cob_fit = QComboBox()
         self.cob_fit.addItems(fit_options)
         top_layout.addWidget(self.cob_fit)
-
         top_layout.addWidget(QLabel("N rois:"))
         self.n_rois_label = QLabel(str(n_rois))
         top_layout.addWidget(self.n_rois_label)
-
         main_layout.addLayout(top_layout)
 
-        # --- Second row: Rows / Cols ---
         grid_layout = QHBoxLayout()
-
         int_validator = QIntValidator(0, 10**9, self)
-
         grid_layout.addWidget(QLabel("Rows:"))
         self.rows_edit = QLineEdit()
         self.rows_edit.setValidator(int_validator)
-        self.rows_edit.setText(str(int(n_rois**0.5)))
+        self.rows_edit.setText(str(max(1, int(n_rois**0.5))))
         grid_layout.addWidget(self.rows_edit)
-
         grid_layout.addWidget(QLabel("Cols:"))
         self.cols_edit = QLineEdit()
         self.cols_edit.setValidator(int_validator)
-        self.cols_edit.setText(str(int(n_rois**0.5)))
+        self.cols_edit.setText(str(max(1, int(np.ceil(n_rois / max(1, int(n_rois**0.5)))))))
         grid_layout.addWidget(self.cols_edit)
-
         main_layout.addLayout(grid_layout)
 
-        # --- Buttons ---
         button_layout = QHBoxLayout()
-
         self.ok_button = QPushButton("OK")
         self.ok_button.clicked.connect(self.accept)
         button_layout.addWidget(self.ok_button)
-
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.reject)
         button_layout.addWidget(self.cancel_button)
-
         main_layout.addLayout(button_layout)
-
         self.setLayout(main_layout)
 
     def get_values(self):
@@ -456,6 +554,7 @@ class HeatmapDialog(QDialog):
             self.cob_fit.currentIndex(),
             int(self.rows_edit.text()) if self.rows_edit.text() else None,
             int(self.cols_edit.text()) if self.cols_edit.text() else None,
+            max(0, self.cob_scan.currentIndex()),
         )
 
 from PyQt6.QtWidgets import (
@@ -799,8 +898,12 @@ class Fitter():
         return wrapper
 
     def perform_fit(self, x, y, fitfunc, yerr=None, guess=None, fixed=None):
-        x = np.array(x)
-        y = np.array(y)
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
+        if len(x) < 2:
+            raise ValueError(f"need ≥2 finite points for fit, got {len(x)}")
         p0 = self.func_dict[fitfunc]['guess'](x, y)
 
         #meh
@@ -993,29 +1096,25 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         self.data_name = args.data
         self.setupUi(self)
-        self._setup_multi_select_ui()
+        self._rebuild_main_layout()
         self.skip = True
         self.cob_x.currentIndexChanged.connect(self.set_x)
-        self.cob_action.currentIndexChanged.connect(self.perform_action)
         self.scrollbar.valueChanged.connect(self.change_plot)
         self.bt_fit.clicked.connect(self.perform_fit)
         self.bt_clear.clicked.connect(self.clear_fit)
         self.bt_export.clicked.connect(self.export_plot)
         self.bt_import.clicked.connect(self.import_data)
         self.bt_global.clicked.connect(self.globalify)
+        self.bt_clear_scans.clicked.connect(self.clear_scans)
+        self.bt_merge.clicked.connect(self.merge_selected_scans)
+        self.bt_2d.clicked.connect(self.two_d_plot)
+        self.bt_heatmap.clicked.connect(self.generate_heatmap)
+        self.bt_batch_fit.clicked.connect(self.batch_fit_selected)
+        self.chk_legend.toggled.connect(self.draw_plot)
         self.bt_fit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.bt_fit.customContextMenuRequested.connect(self.advanced_fit)
 
-        f = QFont("Arial", 12)
-        f.setBold(True)
-        self.pw_plot.getAxis("left").setStyle(tickFont=f)
-        self.pw_plot.getAxis("bottom").setStyle(tickFont=f)
-        self.pw_plot.showAxis("top", show=True)
-        self.pw_plot.showAxis("right", show=True)
-        self.pw_plot.getAxis("top").setStyle(showValues=False)
-        self.pw_plot.getAxis("right").setStyle(showValues=False)
-        self.pw_plot.getAxis("right").setWidth(20)
-        self.pw_plot.addLegend()
+        self._style_plot_item(self.pw_plot.getPlotItem())
 
         self.scans = []
         self.metadata = {"key_sets": [], "points": [], "function": ""}
@@ -1023,33 +1122,325 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.plots = Plots(0)
         self.fitter = Fitter()
         self.n_rois = 1
+        self.tab_recipes = []  # analysis tabs for experiment save/restore
         self.cob_fit.addItems(self.fitter.func_dict.keys())
         self.setWindowTitle("Scan Plot")
 
         # self.req = req
         # self.remote_dataset = Client("127.0.0.1", 3251, "dataset_db")
 
-    def _setup_multi_select_ui(self):
-        """Replace single ROI spinbox with multi-select lists for scans and ROIs."""
+    def _toolbar_sep(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+    def _rebuild_main_layout(self):
+        """Top toolbar + center plot + right scans/ROI panel (layout B)."""
+        # Detach generated grid items without destroying widgets we reuse
+        while self.gridLayout.count():
+            self.gridLayout.takeAt(0)
+
         self.sb_roi.hide()
-        self.sb_roi.setParent(None)
+        for w in (self.lb_x, self.lb_roi, self.lb_fitfunc):
+            w.hide()
 
         self.list_roi = QListWidget()
         self.list_roi.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self.list_roi.setMaximumHeight(90)
         self.list_roi.itemSelectionChanged.connect(self.draw_plot)
-        self.gridLayout.addWidget(self.list_roi, 4, 1, 1, 1)
 
         self.list_scans = QListWidget()
         self.list_scans.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self.list_scans.setMaximumHeight(100)
         self.list_scans.itemSelectionChanged.connect(self._on_scan_selection_changed)
-        self.gridLayout.addWidget(QLabel("Loaded scans"), 7, 0, 1, 1)
-        self.gridLayout.addWidget(self.list_scans, 8, 0, 1, 4)
 
-        clear_scans_btn = QPushButton("Clear scans")
-        clear_scans_btn.clicked.connect(self.clear_scans)
-        self.gridLayout.addWidget(clear_scans_btn, 8, 4, 1, 1)
+        self.bt_clear_scans = QPushButton("Clear scans")
+        self.bt_merge = QPushButton("Merge")
+        self.bt_merge.setToolTip(
+            "Concatenate selected scans into one longer scan (originals kept). "
+            "Requires matching key_sets, function, and ROI count."
+        )
+        self.bt_2d = QPushButton("2D plot")
+        self.bt_2d.setToolTip(
+            "For ≥2D scans: stack scrollbar slices into an image. "
+            "X = current X axis; Y = remaining scan parameter (or slice index)."
+        )
+        self.bt_heatmap = QPushButton("Heatmap")
+        self.bt_heatmap.setToolTip(
+            "Fit all ROIs of one chosen scan and show a parameter as a color grid."
+        )
+        self.bt_batch_fit = QPushButton("Batch fit")
+        self.bt_batch_fit.setToolTip(
+            "Fit and plot parameters vs time / secondary axis / ROI (replaces Fit param)."
+        )
+        self.chk_legend = QCheckBox("Show legend")
+        self.chk_legend.setChecked(False)
+        self.chk_legend.setToolTip(
+            "When unchecked: legend shows only if ≤4 series (short labels). "
+            "When checked: always show legend."
+        )
+
+        # Short labels for toolbar width
+        self.bt_import.setText("Import")
+        self.bt_export.setText("Export")
+        self.bt_export.setToolTip(
+            "Open current curve in a new tab and copy binned data to clipboard"
+        )
+        self.bt_fit.setText("Fit")
+        self.bt_clear.setText("Clear fit")
+        self.bt_global.setText("Global")
+        self.bt_global.setToolTip(
+            "Sum all ROIs of the primary scan into one global curve "
+            "(rewrites that scan's data; not undoable)."
+        )
+
+        # Copy ▾ menu (image / raw data)
+        self.bt_copy = QToolButton()
+        self.bt_copy.setText("Copy")
+        self.bt_copy.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        copy_menu = QMenu(self.bt_copy)
+        act_img = QAction("Copy image", self)
+        act_img.setToolTip("Copy Curves screenshot to clipboard (Ctrl+C)")
+        act_img.triggered.connect(self.copy_plot_image)
+        act_raw = QAction("Copy raw data", self)
+        act_raw.setToolTip("Copy raw x,y of current curve (Ctrl+A)")
+        act_raw.triggered.connect(self.copy_raw_data)
+        copy_menu.addAction(act_img)
+        copy_menu.addAction(act_raw)
+        self.bt_copy.setMenu(copy_menu)
+
+        # Hide obsolete More dropdown (still created by Ui_MainWindow)
+        self.cob_action.hide()
+
+        # --- Top toolbar ---
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        toolbar.addWidget(QLabel("Data:"))
+        toolbar.addWidget(self.bt_import)
+        toolbar.addWidget(self.bt_clear_scans)
+        toolbar.addWidget(self.bt_merge)
+        toolbar.addWidget(self.bt_global)
+        toolbar.addWidget(self._toolbar_sep())
+        toolbar.addWidget(QLabel("View:"))
+        toolbar.addWidget(self.cob_x)
+        toolbar.addWidget(self.chk_legend)
+        toolbar.addWidget(self.bt_2d)
+        toolbar.addWidget(self.bt_export)
+        toolbar.addWidget(self.bt_copy)
+        toolbar.addWidget(self._toolbar_sep())
+        toolbar.addWidget(QLabel("Fit:"))
+        toolbar.addWidget(self.cob_fit)
+        toolbar.addWidget(self.bt_fit)
+        toolbar.addWidget(self.bt_clear)
+        toolbar.addWidget(self._toolbar_sep())
+        toolbar.addWidget(QLabel("Analyze:"))
+        toolbar.addWidget(self.bt_heatmap)
+        toolbar.addWidget(self.bt_batch_fit)
+        toolbar.addStretch(1)
+
+        # --- Curves tab (pyqtgraph) ---
+        curves_col = QVBoxLayout()
+        curves_col.setContentsMargins(0, 0, 0, 0)
+        curves_col.addWidget(self.scrollbar)
+        self.pw_plot.setSizePolicy(
+            QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        )
+        curves_col.addWidget(self.pw_plot, stretch=1)
+        self.lb_fit.setWordWrap(True)
+        self.lb_fit.setMinimumHeight(28)
+        curves_col.addWidget(self.lb_fit)
+        curves_page = QWidget()
+        curves_page.setLayout(curves_col)
+
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.setTabsClosable(True)
+        self.plot_tabs.tabCloseRequested.connect(self._close_plot_tab)
+        self.plot_tabs.addTab(curves_page, "Curves")
+        # Curves tab is not closable
+        self.plot_tabs.tabBar().setTabButton(0, self.plot_tabs.tabBar().ButtonPosition.RightSide, None)
+
+        # --- Right panel: experiments + scans + ROIs ---
+        right = QSplitter(Qt.Orientation.Vertical)
+
+        exp_box = QWidget()
+        exp_layout = QVBoxLayout(exp_box)
+        exp_layout.setContentsMargins(4, 4, 4, 4)
+        exp_layout.addWidget(QLabel("Experiments"))
+        self.list_experiments = QListWidget()
+        self.list_experiments.setMaximumHeight(120)
+        self.list_experiments.setToolTip("Saved experiment packages (.zip). Double-click to load.")
+        self.list_experiments.itemDoubleClicked.connect(self._on_experiment_double_clicked)
+        exp_layout.addWidget(self.list_experiments)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.ed_exp_name = QLineEdit()
+        self.ed_exp_name.setPlaceholderText("experiment name")
+        self.list_experiments.currentTextChanged.connect(self.ed_exp_name.setText)
+        name_row.addWidget(self.ed_exp_name, stretch=1)
+        exp_layout.addLayout(name_row)
+        exp_btn_row = QHBoxLayout()
+        self.bt_save_exp = QPushButton("Save")
+        self.bt_save_exp.setToolTip("Save current session as a .zip package under experiments/")
+        self.bt_open_exp = QPushButton("Load")
+        self.bt_open_exp.setToolTip("Load the selected experiment from the list")
+        self.bt_refresh_exp = QPushButton("Refresh")
+        self.bt_refresh_exp.setToolTip("Rescan experiments/ folder")
+        self.bt_save_exp.clicked.connect(self.save_experiment)
+        self.bt_open_exp.clicked.connect(self.open_experiment)
+        self.bt_refresh_exp.clicked.connect(self.refresh_experiment_list)
+        exp_btn_row.addWidget(self.bt_save_exp)
+        exp_btn_row.addWidget(self.bt_open_exp)
+        exp_btn_row.addWidget(self.bt_refresh_exp)
+        exp_layout.addLayout(exp_btn_row)
+
+        scans_box = QWidget()
+        scans_layout = QVBoxLayout(scans_box)
+        scans_layout.setContentsMargins(4, 4, 4, 4)
+        scans_layout.addWidget(QLabel("Loaded scans"))
+        scans_layout.addWidget(self.list_scans)
+        roi_box = QWidget()
+        roi_layout = QVBoxLayout(roi_box)
+        roi_layout.setContentsMargins(4, 4, 4, 4)
+        roi_layout.addWidget(QLabel("ROI (multi-select)"))
+        roi_layout.addWidget(self.list_roi)
+        right.addWidget(exp_box)
+        right.addWidget(scans_box)
+        right.addWidget(roi_box)
+        right.setStretchFactor(0, 0)
+        right.setStretchFactor(1, 1)
+        right.setStretchFactor(2, 1)
+        right.setMinimumWidth(220)
+        right.setMaximumWidth(320)
+        self.refresh_experiment_list()
+
+        mid = QSplitter(Qt.Orientation.Horizontal)
+        mid.addWidget(self.plot_tabs)
+        mid.addWidget(right)
+        mid.setStretchFactor(0, 1)
+        mid.setStretchFactor(1, 0)
+        mid.setSizes([1000, 240])
+
+        root = QVBoxLayout()
+        root.setContentsMargins(6, 6, 6, 6)
+        root.addLayout(toolbar)
+        root.addWidget(mid, stretch=1)
+        self.gridLayout.addLayout(root, 0, 0)
+
+    def _close_plot_tab(self, index):
+        if index <= 0:
+            return
+        # recipe index = tab index - 1 (Curves is 0)
+        r_i = index - 1
+        if 0 <= r_i < len(self.tab_recipes):
+            self.tab_recipes.pop(r_i)
+        w = self.plot_tabs.widget(index)
+        self.plot_tabs.removeTab(index)
+        if w is not None:
+            w.deleteLater()
+
+    def _record_tab_recipe(self, recipe):
+        self.tab_recipes.append(recipe)
+
+    def _clear_analysis_tabs(self):
+        while self.plot_tabs.count() > 1:
+            self._close_plot_tab(1)
+        self.tab_recipes = []
+
+    def _style_plot_item(self, plot_item):
+        """Match Curves tab axis / label look."""
+        f = QFont("Arial", 12)
+        f.setBold(True)
+        plot_item.getAxis("left").setStyle(tickFont=f)
+        plot_item.getAxis("bottom").setStyle(tickFont=f)
+        plot_item.showAxis("top", show=True)
+        plot_item.showAxis("right", show=True)
+        plot_item.getAxis("top").setStyle(showValues=False)
+        plot_item.getAxis("right").setStyle(showValues=False)
+        plot_item.getAxis("right").setWidth(20)
+
+    def _new_plot_widget(self, date_axis=False):
+        if date_axis:
+            pw = PlotWidget(axisItems={"bottom": DateAxisItem(orientation="bottom")})
+        else:
+            pw = PlotWidget()
+        self._style_plot_item(pw.getPlotItem())
+        return pw
+
+    def _unique_tab_name(self, title):
+        existing = {self.plot_tabs.tabText(i) for i in range(self.plot_tabs.count())}
+        name = title
+        n = 2
+        while name in existing:
+            name = f"{title} ({n})"
+            n += 1
+        return name
+
+    def show_plot_tab(self, title, widget):
+        """Embed a pyqtgraph widget in a new closable tab (Curves-style)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(widget)
+        idx = self.plot_tabs.addTab(page, self._unique_tab_name(title))
+        self.plot_tabs.setCurrentIndex(idx)
+        return widget
+
+    def _add_errorbar_scatter(self, plot_item, unique_x, means, heights, y_centers=None, style=None, name=None):
+        """Scatter + ErrorBarItem on a PlotItem (same look as Curves)."""
+        style = style or dict(style_sheet)
+        unique_x = np.asarray(unique_x, dtype=float)
+        means = np.asarray(means, dtype=float)
+        heights = np.asarray(heights, dtype=float)
+        if y_centers is None:
+            y_centers = means
+        else:
+            y_centers = np.asarray(y_centers, dtype=float)
+        idx = np.isfinite(heights) & (heights > 0)
+        if np.any(idx):
+            beam = 0.007 * (unique_x.max() - unique_x.min()) if len(unique_x) else 0.01
+            plot_item.addItem(
+                ErrorBarItem(x=unique_x[idx], y=y_centers[idx], height=heights[idx], beam=beam)
+            )
+        plot_kw = dict(style)
+        if name:
+            plot_kw["name"] = name
+        plot_item.plot(unique_x, means, **plot_kw)
+
+    def _add_image_with_colorbar(self, data, x0, y0, w, h, xlabel="", ylabel="", title=""):
+        """GraphicsLayoutWidget with ImageItem + ColorBarItem (viridis)."""
+        glw = GraphicsLayoutWidget()
+        plot = glw.addPlot(row=0, col=0)
+        self._style_plot_item(plot)
+        if xlabel:
+            plot.setLabel("bottom", xlabel, **font)
+        if ylabel:
+            plot.setLabel("left", ylabel, **font)
+        if title:
+            plot.setTitle(title, **font)
+        img_data = np.asarray(data, dtype=float)
+        cmap = pg_colormap.get("viridis")
+        lut = cmap.getLookupTable(nPts=256)
+        img = ImageItem(img_data)
+        img.setOpts(axisOrder="row-major")
+        img.setLookupTable(lut)
+        img.setRect(x0, y0, w, h)
+        plot.addItem(img)
+        finite = img_data[np.isfinite(img_data)]
+        if finite.size:
+            vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+            if vmin == vmax:
+                vmax = vmin + 1.0
+        else:
+            vmin, vmax = 0.0, 1.0
+        img.setLevels([vmin, vmax])
+        cbar = ColorBarItem(
+            values=(vmin, vmax),
+            colorMap=cmap,
+            width=18,
+            interactive=False,
+        )
+        glw.addItem(cbar, row=0, col=1)
+        cbar.setImageItem(img)
+        return glw
 
     def closeEvent(self, event):
         #mainly just prevents a warning in artiq when closing applet
@@ -1058,38 +1449,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_C and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            screenshot = self.pw_plot.grab()
-            clipboard = QApplication.clipboard()
-            clipboard.setPixmap(screenshot)
+            self.copy_plot_image()
         if event.key() == Qt.Key.Key_A and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            x, y = self.get_current_data()
-            self.copy_to_clipboard(x=x, y=y)
+            self.copy_raw_data()
         if event.key() == Qt.Key.Key_Q and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             self.two_d_plot()
 
-    def perform_action(self, index):
-        match index:
-            case 0:
-                return
-            case 1:  # copy image
-                screenshot = self.pw_plot.grab()
-                clipboard = QApplication.clipboard()
-                clipboard.setPixmap(screenshot)
-            case 2:  # copy raw data
-                x, y = self.get_current_data()
-                self.copy_to_clipboard(x=x, y=y)
-            case 3:  # 2d plot
-                self.two_d_plot()
-            case 4:  # plot fit parameter
-                self.parameter_plot()
-            case 5:  # generate heat map
-                self.generate_heatmap()
-            case 6:
-                self.merge_selected_scans()
-            case 7:
-                self.batch_fit_selected()
+    def copy_plot_image(self):
+        screenshot = self.pw_plot.grab()
+        QApplication.clipboard().setPixmap(screenshot)
 
-        self.cob_action.setCurrentIndex(0)
+    def copy_raw_data(self):
+        x, y = self.get_current_data()
+        self.copy_to_clipboard(x=x, y=y)
 
     def selected_scan_indices(self):
         return sorted({item.row() for item in self.list_scans.selectedIndexes()})
@@ -1129,6 +1501,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.scans = []
         self.list_scans.clear()
         self.list_roi.clear()
+        self._clear_analysis_tabs()
         self.metadata = {"key_sets": [], "points": [], "function": ""}
         self.data = []
         self.plots = Plots(0)
@@ -1254,12 +1627,21 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         color = OVERLAY_COLORS[color_index % len(OVERLAY_COLORS)]
         return {"pen": None, "symbol": "o", "symbolPen": None, "symbolBrush": color}
 
+    def _scan_short_name(self, scan):
+        return scan.name.replace("\\", "/").rstrip("/").split("/")[-1]
+
+    def _series_legend_name(self, scan, roi, n_scans, n_rois):
+        short = self._scan_short_name(scan)
+        if n_scans == 1:
+            return f"ROI {roi}"
+        if n_rois == 1:
+            return short
+        return f"{short}/R{roi}"
+
     def draw_plot(self):
         if self.skip:
             return
         self.pw_plot.clear()
-        # re-add legend after clear
-        self.pw_plot.addLegend()
 
         scan_idxs = self.selected_scan_indices()
         roi_idxs = self.selected_roi_indices()
@@ -1267,56 +1649,52 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.lb_fit.setText("")
             return
 
-        color_i = 0
         slice_index = self.scrollbar.value()
+        # Collect drawable series first (for legend policy)
+        series = []
         for s_i in scan_idxs:
             scan = self.scans[s_i]
             if scan.plots is None or not scan.plots.plots:
                 continue
-            n_slices = scan.plots.n_plots()
-            if slice_index >= n_slices:
+            if slice_index >= scan.plots.n_plots():
                 logging.warning("Scan %s has no slice index %s; skipping", scan.name, slice_index)
                 continue
             for roi in roi_idxs:
                 if roi >= scan.plots.n_rois:
                     logging.warning("Scan %s has no ROI %s; skipping", scan.name, roi)
                     continue
-                x, y = scan.plots.get_data(slice_index, roi)
-                if not scan.metadata["key_sets"]:
-                    x = np.arange(len(y))
-                name = f"{scan.name} / ROI {roi}"
-                style = self._series_style(color_i)
-                if "survival" in scan.metadata["function"].lower():
-                    self.plot_survival(x, y, style=style, name=name)
-                else:
-                    self.plot_errorbars(x, y, style=style, name=name)
-                color_i += 1
+                series.append((scan, roi))
+
+        show_legend = self.chk_legend.isChecked() or len(series) <= 4
+        if show_legend:
+            self.pw_plot.addLegend()
+
+        n_scans = len({id(s) for s, _ in series})
+        n_rois = len({r for _, r in series})
+        for color_i, (scan, roi) in enumerate(series):
+            x, y = scan.plots.get_data(slice_index, roi)
+            if not scan.metadata["key_sets"]:
+                x = np.arange(len(y))
+            name = self._series_legend_name(scan, roi, n_scans, n_rois) if show_legend else None
+            style = self._series_style(color_i)
+            if "survival" in scan.metadata["function"].lower():
+                self.plot_survival(x, y, style=style, name=name)
+            else:
+                self.plot_errorbars(x, y, style=style, name=name)
 
         # Overlay fits for every selected scan × ROI that has a stored fit
         summaries = []
-        color_i = 0
-        for s_i in scan_idxs:
-            scan = self.scans[s_i]
-            if scan.plots is None or not scan.plots.plots:
-                color_i += len(roi_idxs)
-                continue
-            if slice_index >= scan.plots.n_plots():
-                color_i += len(roi_idxs)
-                continue
-            for roi in roi_idxs:
-                if roi >= scan.plots.n_rois:
-                    color_i += 1
-                    continue
-                fit, params, popt, perr = scan.plots.get_fit(slice_index, roi)
-                if fit:
-                    self.pw_plot.addItem(fit)
-                    if params is not None and popt is not None:
-                        short = ", ".join(
-                            f"{p}={self.format_fit_params(v, e)}"
-                            for p, v, e in zip(params, popt, perr)
-                        )
-                        summaries.append(f"ROI{roi}: {short}" if len(scan_idxs) == 1 else f"{scan.name}/ROI{roi}: {short}")
-                color_i += 1
+        for scan, roi in series:
+            fit, params, popt, perr = scan.plots.get_fit(slice_index, roi)
+            if fit:
+                self.pw_plot.addItem(fit)
+                if params is not None and popt is not None:
+                    short = ", ".join(
+                        f"{p}={self.format_fit_params(v, e)}"
+                        for p, v, e in zip(params, popt, perr)
+                    )
+                    label = f"ROI{roi}" if n_scans == 1 else f"{self._scan_short_name(scan)}/ROI{roi}"
+                    summaries.append(f"{label}: {short}")
         if summaries:
             # Keep status bar readable: show all if few, else first + count
             if len(summaries) <= 2:
@@ -1345,7 +1723,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             error_bars = ErrorBarItem(x=unique_x[idx], y=y_centers, height=heights, beam=beam)
             self.pw_plot.addItem(error_bars)
 
-        self.pw_plot.plot(unique_x, means, name=name, **style)
+        plot_kw = dict(style)
+        if name:
+            plot_kw["name"] = name
+        self.pw_plot.plot(unique_x, means, **plot_kw)
 
     def plot_errorbars(self, x, y, style=None, name=None):
         style = style or style_sheet
@@ -1361,7 +1742,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 x=unique_x[idx], y=means[idx], height=err[idx] * 2, beam=beam
             )
             self.pw_plot.addItem(error_bars)
-        self.pw_plot.plot(unique_x, means, name=name, **style)
+        plot_kw = dict(style)
+        if name:
+            plot_kw["name"] = name
+        self.pw_plot.plot(unique_x, means, **plot_kw)
     
     def get_errorbars(self, x, y):
         # NaN entries mark shots excluded upstream (e.g. "Sorting success
@@ -1663,19 +2047,27 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         x_step = (global_x[-1] - global_x[0]) / (len(global_x) - 1) if len(global_x) > 1 else 1
         y_step = (y_vals[-1] - y_vals[0]) / (len(y_vals) - 1) if len(y_vals) > 1 else 1
-        extent = [global_x[0] - x_step/2, global_x[-1] + x_step/2, y_vals[-1] + y_step/2, y_vals[0] - y_step/2]
+        x0 = float(global_x[0] - x_step / 2)
+        y0 = float(y_vals[0] - y_step / 2)
+        w = float(global_x[-1] - global_x[0] + x_step)
+        h = float(y_vals[-1] - y_vals[0] + y_step)
 
-        plt.clf()
-        plt.imshow(data, extent=extent, aspect="auto")
-        plt.axis("off")
-        self.copy_figure_to_clipboard(plt.gcf())
-        plt.axis("on")
-        plt.colorbar()
-        plt.xlabel(self.cob_x.currentText())
-        
         y_keys = [key[-1] for i, key in enumerate(self.metadata["key_sets"]) if i != self.plots.x_index]
-        plt.ylabel(", ".join(y_keys) if y_keys else "index")
-        plt.show()
+        glw = self._add_image_with_colorbar(
+            data,
+            x0, y0, w, h,
+            xlabel=self.cob_x.currentText(),
+            ylabel=", ".join(y_keys) if y_keys else "index",
+        )
+        self.show_plot_tab("2D plot", glw)
+        self._record_tab_recipe({
+            "type": "2d",
+            "scan_sel": self.selected_scan_indices(),
+            "roi_sel": self.selected_roi_indices(),
+            "x_index": self.cob_x.currentIndex(),
+            "slice": self.scrollbar.value(),
+        })
+        self.copy_widget_to_clipboard(glw)
 
     def export_plot(self):
         x, y = self.get_current_data()
@@ -1684,126 +2076,226 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             unique_x, means, err = self.get_survival_rate(x, y)
             lower = err[0]
             upper = err[1]
-            idx = (lower > 0) | (upper > 0)
-            heights = (lower[idx] + upper[idx]) / 2
-            y_centers = means[idx] + (upper[idx] - lower[idx]) / 2
-
+            heights = lower + upper
+            y_centers = means + (upper - lower) / 2
+            clip_heights = heights / 2
         else:
             unique_x, means, err = self.get_errorbars(x, y)
-            heights = err
+            heights = err * 2
             y_centers = means
+            clip_heights = err
 
-        self.copy_to_clipboard(x=unique_x, y=means, yerr=heights, yerr_center=y_centers)
-        idx = heights > 0
-        plt.scatter(unique_x, means)
-        plt.errorbar(unique_x[idx], y_centers[idx], yerr=heights[idx], capsize=3, fmt="none")
-        plt.xlabel(self.cob_x.currentText())
-        plt.ylabel(self.metadata["function"])
+        self.copy_to_clipboard(x=unique_x, y=means, yerr=clip_heights, yerr_center=y_centers)
+        pw = self._new_plot_widget()
+        pw.setLabel("bottom", self.cob_x.currentText(), **font)
+        pw.setLabel("left", self.metadata["function"], **font)
+        self._add_errorbar_scatter(pw.getPlotItem(), unique_x, means, heights, y_centers=y_centers)
 
         fit, _, _, _ = self.plots.get_fit(*self.get_plot_indices())
         if fit:
-            x, y = fit.getData()
-            plt.plot(x, y, c="r")
+            fx, fy = fit.getData()
+            pw.plot(fx, fy, pen=mkPen((227, 26, 28), width=2))
+        self.show_plot_tab("Export", pw)
+        self._record_tab_recipe({
+            "type": "export",
+            "scan_sel": self.selected_scan_indices(),
+            "roi_sel": self.selected_roi_indices(),
+            "x_index": self.cob_x.currentIndex(),
+            "slice": self.scrollbar.value(),
+        })
 
-        plt.show()
-    
     def copy_to_clipboard(self, **kwargs):
         headers = "\t".join(kwargs.keys())
         rows = "\n".join("\t".join(map(str, row)) for row in zip(*kwargs.values()))
         clipboard_data = headers + "\n" + rows + "\n"
         clipboard = QApplication.clipboard()
         clipboard.setText(clipboard_data)
-        
-    def parameter_plot(self):
-        self.sync_primary_aliases()
-        if not self.plots or not self.plots.plots:
-            logging.error("No plot data")
-            return
 
-        xs = [key[-1] for key in self.metadata["key_sets"]] + ["ROI"]
-        del xs[self.plots.x_index]
-        fitfunc = self.cob_fit.currentText()
+    def _plot_param_scatter(self, scan, fitfunc, param_name, mode, recipe_extra=None):
+        """Fit-param style plot for one scan: vs secondary axis or vs ROI."""
+        if scan.plots is None or not scan.plots.plots:
+            logging.error("No plot data for %s", scan.name)
+            return False
         fit_params = self.fitter.func_dict[fitfunc]["params"]
-
-        dialog = ParameterDialog(fit_params, xs)
-
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            fit_value, x_value = dialog.get_values()
-        else:
-            return
-
-        ys = []
-        yerr = []
+        if param_name not in fit_params:
+            logging.error("Unknown param %s", param_name)
+            return False
+        fit_value = fit_params.index(param_name)
         selected_rois = self.selected_roi_indices()
-        if x_value == len(xs) - 1:
+        slice_index = self.scrollbar.value()
+        x_index = scan.plots.x_index
+
+        if mode == BatchAnalyzeDialog.MODE_ROI:
+            index = [slice_index] * len(selected_rois)
             roi = selected_rois
-            index = [self.scrollbar.value()] * len(roi)
-            xs = roi
-            plt.xlabel("ROI")
+            xs = list(selected_rois)
+            xlabel = "ROI"
         else:
-            index = range(self.scrollbar.maximum() + 1)
+            # vs secondary scan axis (first non-x key dimension in plot keys)
+            axis_labels = [key[-1] for i, key in enumerate(scan.metadata["key_sets"]) if i != x_index]
+            if not axis_labels:
+                logging.error("Scan has no secondary axis for vs-axis mode")
+                return False
+            xlabel = axis_labels[0]
+            index = list(range(scan.plots.n_plots()))
             roi = [selected_rois[0]] * len(index)
-            plt.xlabel(xs[x_value])
-            xs = [v[x_value] for v in self.plots.plots.keys()]
+            xs = [list(k)[0] if len(k) else i for i, k in enumerate(scan.plots.plots.keys())]
 
+        ys, yerr, failures = [], [], []
         for i, r in zip(index, roi):
-            xp, yp = self.plots.get_data(i, r)
-            if "survival" in self.metadata["function"].lower():
-                xp, yp, errors = self.get_survival_rate(xp, yp)
-                xp = xp[~np.isnan(yp)]
-                yp = yp[~np.isnan(yp)]
-
-            x, y, popt, perr = self.fitter.perform_fit(xp, yp, fitfunc)
-            ys.append(popt[fit_value])
-            yerr.append(perr[fit_value])
-            fit = self.pw_plot.plot(x, y)
-            self.plots.add_fit(i, r, fit, fit_params, popt, perr)
-
-        self.draw_plot()
-        self.copy_to_clipboard(x=xs, y=ys, yerr=yerr)
-        plt.errorbar(xs, ys, capsize=3, fmt="o")
-        plt.grid()
-        plt.ylabel(fit_params[fit_value])
-        plt.show()
-
-    def generate_heatmap(self):
-        self.sync_primary_aliases()
-        n_rois = self.plots.n_rois if self.plots else 0
-        if n_rois < 2:
-            logging.error("Cannot make heatmap of global data")
-            return
-
-        fitfunc = self.cob_fit.currentText()
-        fit_params = self.fitter.func_dict[fitfunc]["params"]
-
-        dialog = HeatmapDialog(fit_params, n_rois)
-
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            fit_value, num_rows, num_cols = dialog.get_values()
-        else:
-            return
-
-        ys = []
-        for i, r in zip([self.scrollbar.value()] * n_rois, range(n_rois)):
-            xp, yp = self.plots.get_data(i, r)
-            if "survival" in self.metadata["function"].lower():
+            xp, yp = scan.plots.get_data(i, r)
+            if "survival" in scan.metadata["function"].lower():
                 xp, yp, _ = self.get_survival_rate(xp, yp)
                 xp = xp[~np.isnan(yp)]
                 yp = yp[~np.isnan(yp)]
+            try:
+                x, y, popt, perr = self.fitter.perform_fit(xp, yp, fitfunc)
+                ys.append(popt[fit_value])
+                yerr.append(perr[fit_value])
+                fit = self.pw_plot.plot(x, y)
+                scan.plots.add_fit(i, r, fit, fit_params, popt, perr)
+            except Exception as exc:
+                failures.append(f"slice={i} ROI={r}: {exc}")
+                ys.append(np.nan)
+                yerr.append(np.nan)
 
-            x, y, popt, perr = self.fitter.perform_fit(xp, yp, fitfunc)
-            ys.append(popt[fit_value])
-            fit = self.pw_plot.plot(x, y)
-            self.plots.add_fit(i, r, fit, fit_params, popt, perr)
+        if failures:
+            logging.warning("Fit param issues (%s):\n%s", len(failures), "\n".join(failures[:10]))
+        if not any(np.isfinite(ys)):
+            logging.error("Fit param: no valid fits")
+            return False
 
         self.draw_plot()
+        self.copy_to_clipboard(x=xs, y=ys, yerr=yerr)
+        pw = self._new_plot_widget()
+        pw.showGrid(x=True, y=True, alpha=0.3)
+        pw.setLabel("bottom", xlabel, **font)
+        pw.setLabel("left", param_name, **font)
+        xs_arr = np.asarray(xs, dtype=float)
+        ys_arr = np.asarray(ys, dtype=float)
+        yerr_arr = np.asarray(yerr, dtype=float)
+        finite = np.isfinite(ys_arr)
+        self._add_errorbar_scatter(
+            pw.getPlotItem(),
+            xs_arr[finite],
+            ys_arr[finite],
+            np.nan_to_num(yerr_arr[finite], nan=0.0) * 2,
+            y_centers=ys_arr[finite],
+        )
+        title = f"Fit param: {param_name} ({mode})"
+        self.show_plot_tab(title, pw)
+        recipe = {
+            "type": "batch",
+            "mode": mode,
+            "fitfunc": fitfunc,
+            "params": [param_name],
+            "scan_name": scan.name,
+            "roi_sel": selected_rois,
+            "slice": slice_index,
+            "x_index": self.cob_x.currentIndex(),
+        }
+        if recipe_extra:
+            recipe.update(recipe_extra)
+        self._record_tab_recipe(recipe)
+        return True
 
-        arr = np.asarray(ys).reshape((num_rows, num_cols))
+    def generate_heatmap(self, recipe=None):
+        # Qt clicked(bool) may pass False — only dict recipes are valid
+        if not isinstance(recipe, dict):
+            recipe = None
+        scan_idxs = self.selected_scan_indices()
+        if not scan_idxs:
+            logging.error("Select at least one scan for heatmap")
+            return
+        labels = [self.scans[i].name for i in scan_idxs]
+        # Use first selected scan's ROI count for dialog defaults; update after pick
+        probe = self.scans[scan_idxs[0]]
+        if probe.plots is None:
+            logging.error("No plots for selected scan")
+            return
+        fitfunc = self.cob_fit.currentText()
+        fit_params = self.fitter.func_dict[fitfunc]["params"]
+
+        if recipe is None:
+            dialog = HeatmapDialog(fit_params, probe.plots.n_rois, scan_labels=labels, parent=self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            fit_value, num_rows, num_cols, label_i = dialog.get_values()
+            if num_rows is None or num_cols is None:
+                return
+            scan = self.scans[scan_idxs[label_i]]
+            param_name = fit_params[fit_value]
+        else:
+            scan = next((s for s in self.scans if s.name == recipe.get("scan_name")), None)
+            if scan is None and scan_idxs:
+                scan = self.scans[scan_idxs[0]]
+            if scan is None:
+                logging.error("Heatmap recipe: scan not found")
+                return
+            param_name = recipe["param"]
+            fit_value = fit_params.index(param_name) if param_name in fit_params else 0
+            num_rows, num_cols = recipe["rows"], recipe["cols"]
+            fitfunc = recipe.get("fitfunc", fitfunc)
+
+        if scan.plots is None or scan.plots.n_rois < 2:
+            logging.error("Cannot make heatmap of global / single-ROI data")
+            return
+
+        n_rois = scan.plots.n_rois
+        slice_index = self.scrollbar.value() if recipe is None else recipe.get("slice", 0)
+        ys, failures = [], []
+        for r in range(n_rois):
+            xp, yp = scan.plots.get_data(min(slice_index, scan.plots.n_plots() - 1), r)
+            if "survival" in scan.metadata["function"].lower():
+                xp, yp, _ = self.get_survival_rate(xp, yp)
+                xp = xp[~np.isnan(yp)]
+                yp = yp[~np.isnan(yp)]
+            try:
+                x, y, popt, perr = self.fitter.perform_fit(xp, yp, fitfunc)
+                ys.append(popt[fit_value])
+                fit = self.pw_plot.plot(x, y)
+                scan.plots.add_fit(slice_index, r, fit, fit_params, popt, perr)
+            except Exception as exc:
+                failures.append(f"ROI {r}: {exc}")
+                ys.append(np.nan)
+
+        if failures:
+            logging.warning("Heatmap fit issues (%s/%s ROIs):\n%s",
+                            len(failures), n_rois, "\n".join(failures[:10]))
+        if not any(np.isfinite(ys)):
+            logging.error("Heatmap: no ROI produced a valid fit")
+            return
+        if num_rows * num_cols != len(ys):
+            logging.error(
+                "Heatmap grid %sx%s != %s ROIs; adjust rows/cols in dialog",
+                num_rows, num_cols, len(ys),
+            )
+            return
+
+        self.draw_plot()
+        arr = np.asarray(ys, dtype=float).reshape((num_rows, num_cols))
         keys = [f"c{i}" for i in range(num_cols)]
         self.copy_to_clipboard(**dict(zip(keys, arr.T)))
-        plt.imshow(arr)
-        plt.colorbar()
-        plt.show()
+        short = self._scan_short_name(scan)
+        glw = self._add_image_with_colorbar(
+            arr,
+            -0.5, -0.5, num_cols, num_rows,
+            xlabel="col",
+            ylabel="row",
+            title=f"{param_name} — {short}",
+        )
+        self.show_plot_tab(f"Heatmap: {param_name} ({short})", glw)
+        if recipe is None:
+            self._record_tab_recipe({
+                "type": "heatmap",
+                "scan_name": scan.name,
+                "param": param_name,
+                "fitfunc": fitfunc,
+                "rows": num_rows,
+                "cols": num_cols,
+                "slice": slice_index,
+                "x_index": self.cob_x.currentIndex(),
+            })
 
     def count_clusters(self, values, threshold=3):
         if len(values) == 1:
@@ -1892,7 +2384,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.rebuild_scan_list_widget(select_indices=[len(self.scans) - 1])
         self.create_new_plot()
 
-    def batch_fit_selected(self):
+    def batch_fit_selected(self, recipe=None):
+        # Qt clicked(bool) may pass False as first arg — only dict recipes are valid
+        if not isinstance(recipe, dict):
+            recipe = None
         scan_idxs = self.selected_scan_indices()
         roi_idxs = self.selected_roi_indices()
         if not scan_idxs:
@@ -1903,10 +2398,40 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             logging.error("Unknown fit function: %s", fitfunc)
             return
         fit_params = self.fitter.func_dict[fitfunc]["params"]
-        slice_index = self.scrollbar.value()
+        labels = [self.scans[i].name for i in scan_idxs]
 
-        rows = []
-        failures = []
+        if recipe is None:
+            dialog = BatchAnalyzeDialog(fit_params, labels, parent=self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            mode = dialog.selected_mode()
+            plot_params = [p for p in fit_params if p in dialog.selected_params()]
+            target_label_i = dialog.selected_scan_index()
+            if not plot_params:
+                return
+        else:
+            mode = recipe.get("mode", BatchAnalyzeDialog.MODE_TIME)
+            plot_params = recipe.get("params") or fit_params[:1]
+            fitfunc = recipe.get("fitfunc", fitfunc)
+            fit_params = self.fitter.func_dict[fitfunc]["params"]
+            name = recipe.get("scan_name")
+            target_label_i = 0
+            if name:
+                for j, lab in enumerate(labels):
+                    if lab == name:
+                        target_label_i = j
+                        break
+            roi_idxs = recipe.get("roi_sel", roi_idxs)
+
+        if mode in (BatchAnalyzeDialog.MODE_AXIS, BatchAnalyzeDialog.MODE_ROI):
+            scan = self.scans[scan_idxs[target_label_i]]
+            for param in plot_params:
+                self._plot_param_scatter(scan, fitfunc, param, mode)
+            return
+
+        # --- vs time (original batch fit) ---
+        slice_index = self.scrollbar.value() if recipe is None else recipe.get("slice", self.scrollbar.value())
+        rows, failures = [], []
         for s_i in scan_idxs:
             scan = self.scans[s_i]
             if scan.plots is None or not scan.plots.plots:
@@ -1962,53 +2487,287 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             logging.error("Batch fit produced no rows")
             return
 
-        # clipboard TSV
         headers = ["scan", "roi", "time"] + [h for p in fit_params for h in (p, f"{p}_err")]
         lines = ["\t".join(headers)]
         for row in rows:
             lines.append("\t".join(str(row.get(h, "")) for h in headers))
         QApplication.clipboard().setText("\n".join(lines) + "\n")
 
-        # parameter vs time plots
-        n_params = len(fit_params)
-        fig, axes = plt.subplots(n_params, 1, figsize=(8, 2.5 * n_params), sharex=True)
-        if n_params == 1:
-            axes = [axes]
-        for ax, param in zip(axes, fit_params):
-            for roi in roi_idxs:
-                xs, ys, yerr = [], [], []
+        n_params = len(plot_params)
+        use_time = any(row["time"] for row in rows)
+        glw = GraphicsLayoutWidget()
+        first_plot = None
+        for ax_i, param in enumerate(plot_params):
+            if use_time:
+                p = glw.addPlot(
+                    row=ax_i, col=0,
+                    axisItems={"bottom": DateAxisItem(orientation="bottom")},
+                )
+            else:
+                p = glw.addPlot(row=ax_i, col=0)
+            self._style_plot_item(p)
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.setLabel("left", param, **font)
+            if ax_i == 0:
+                p.addLegend()
+                p.setTitle(f"Batch fit: {fitfunc} vs time", **font)
+                first_plot = p
+            else:
+                p.setXLink(first_plot)
+            if ax_i == n_params - 1:
+                p.setLabel("bottom", "scan time", **font)
+            else:
+                p.getAxis("bottom").setStyle(showValues=False)
+
+            for color_i, roi in enumerate(roi_idxs):
+                points = []
                 for row in rows:
                     if row["roi"] != roi:
                         continue
                     if row["time"]:
-                        xs.append(datetime.fromisoformat(row["time"]))
+                        xval = datetime.fromisoformat(row["time"]).timestamp()
                     else:
-                        xs.append(row["t_index"])
-                    ys.append(row[param])
-                    yerr.append(row[f"{param}_err"])
-                if not xs:
+                        xval = float(row["t_index"])
+                    points.append((xval, row[param], row[f"{param}_err"]))
+                if not points:
                     continue
-                ax.errorbar(xs, ys, yerr=yerr, fmt="o", capsize=3, label=f"ROI {roi}")
-            ax.set_ylabel(param)
-            ax.grid(True)
-            ax.legend()
-        axes[-1].set_xlabel("scan time")
-        fig.suptitle(f"Batch fit: {fitfunc}")
-        fig.tight_layout()
-        plt.show()
+                points.sort(key=lambda t: t[0])
+                xs = np.array([pt[0] for pt in points], dtype=float)
+                ys = np.array([pt[1] for pt in points], dtype=float)
+                yerr = np.array([pt[2] for pt in points], dtype=float)
+                color = OVERLAY_COLORS[color_i % len(OVERLAY_COLORS)]
+                style = {
+                    "pen": mkPen(color, width=2),
+                    "symbol": "o",
+                    "symbolPen": None,
+                    "symbolBrush": color,
+                }
+                self._add_errorbar_scatter(
+                    p, xs, ys, yerr * 2, y_centers=ys,
+                    style=style, name=f"ROI {roi}" if ax_i == 0 else None,
+                )
+        self.show_plot_tab(f"Batch fit: {fitfunc}", glw)
+        if recipe is None:
+            self._record_tab_recipe({
+                "type": "batch",
+                "mode": BatchAnalyzeDialog.MODE_TIME,
+                "fitfunc": fitfunc,
+                "params": plot_params,
+                "scan_sel_names": [self.scans[i].name for i in scan_idxs],
+                "roi_sel": roi_idxs,
+                "slice": slice_index,
+                "x_index": self.cob_x.currentIndex(),
+            })
 
-    def copy_figure_to_clipboard(self, fig):
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.02)
-        buf.seek(0)
+    def _scan_to_serializable(self, scan):
+        """Embed scan metadata + data for zip package (portable)."""
+        return {
+            "name": scan.name,
+            "path": str(scan.path),
+            "metadata": scan.metadata,
+            "data": scan.data,
+        }
 
-        img = Image.open(buf).convert("RGB")
+    def _scan_from_serializable(self, obj):
+        return ScanDataset(
+            name=obj["name"],
+            path=Path(obj.get("path", "")),
+            metadata=obj["metadata"],
+            data=obj["data"],
+            plots=None,
+        )
 
+    def refresh_experiment_list(self):
+        EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        cur = self.list_experiments.currentItem()
+        cur_name = cur.text() if cur else None
+        self.list_experiments.clear()
+        for z in sorted(EXPERIMENTS_DIR.glob("*.zip")):
+            self.list_experiments.addItem(z.stem)
+        if cur_name:
+            matches = self.list_experiments.findItems(cur_name, Qt.MatchFlag.MatchExactly)
+            if matches:
+                self.list_experiments.setCurrentItem(matches[0])
+
+    def _selected_experiment_path(self):
+        item = self.list_experiments.currentItem()
+        name = (item.text() if item else "") or self.ed_exp_name.text().strip()
+        name = re.sub(r'[<>:"/\\|?*]', "_", name)
+        if not name:
+            return None
+        return EXPERIMENTS_DIR / f"{name}.zip"
+
+    def _on_experiment_double_clicked(self, item):
+        self.ed_exp_name.setText(item.text())
+        self.open_experiment()
+
+    def save_experiment(self):
+        if not self.scans:
+            QMessageBox.warning(self, "Save experiment", "No scans loaded.")
+            return
+        EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        name = self.ed_exp_name.text().strip()
+        if not name:
+            item = self.list_experiments.currentItem()
+            name = item.text() if item else ""
+        if not name.strip():
+            QMessageBox.warning(self, "Save experiment", "Enter a name in the Name field.")
+            return
+        name = re.sub(r'[<>:"/\\|?*]', "_", name.strip())
+        self.ed_exp_name.setText(name)
+        zip_path = EXPERIMENTS_DIR / f"{name}.zip"
+        if zip_path.exists():
+            ans = QMessageBox.question(
+                self, "Overwrite?",
+                f"{zip_path.name} already exists. Overwrite?",
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        payload = {
+            "version": 1,
+            "name": name,
+            "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+            "ui": {
+                "x_index": self.cob_x.currentIndex(),
+                "fitfunc": self.cob_fit.currentText(),
+                "slice": self.scrollbar.value(),
+                "legend": self.chk_legend.isChecked(),
+                "scan_sel_names": [self.scans[i].name for i in self.selected_scan_indices()],
+                "roi_sel": self.selected_roi_indices(),
+            },
+            "scans": [self._scan_to_serializable(s) for s in self.scans],
+            "tabs": copy.deepcopy(self.tab_recipes),
+        }
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("experiment.json", json.dumps(payload, indent=2, default=str))
+            self.refresh_experiment_list()
+            matches = self.list_experiments.findItems(name, Qt.MatchFlag.MatchExactly)
+            if matches:
+                self.list_experiments.setCurrentItem(matches[0])
+        except Exception as exc:
+            logging.exception("Save experiment failed")
+            QMessageBox.critical(self, "Save failed", str(exc))
+
+    def open_experiment(self):
+        zip_path = self._selected_experiment_path()
+        if zip_path is None or not zip_path.is_file():
+            QMessageBox.warning(
+                self, "Load experiment",
+                "Select an experiment in the list (or type an existing name).",
+            )
+            return
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                raw = zf.read("experiment.json")
+            payload = json.loads(raw)
+        except Exception as exc:
+            logging.exception("Open experiment failed")
+            QMessageBox.critical(self, "Open failed", str(exc))
+            return
+
+        self.clear_scans()
+        new_scans = []
+        for obj in payload.get("scans", []):
+            try:
+                meta = obj["metadata"]
+                meta["points"] = [tuple(p) if not isinstance(p, tuple) else p for p in meta.get("points", [])]
+                meta["key_sets"] = [list(k) for k in meta.get("key_sets", [])]
+                new_scans.append(self._scan_from_serializable(obj))
+            except Exception as exc:
+                logging.exception("Skipping scan in experiment: %s", exc)
+
+        if not new_scans:
+            QMessageBox.warning(self, "Open experiment", "No scans in package.")
+            return
+
+        self.scans = new_scans
+        ui = payload.get("ui", {})
+        name_to_i = {s.name: i for i, s in enumerate(self.scans)}
+        sel = [name_to_i[n] for n in ui.get("scan_sel_names", []) if n in name_to_i]
+        if not sel:
+            sel = list(range(len(self.scans)))
+        self.rebuild_scan_list_widget(select_indices=sel)
+        self.create_new_plot()
+
+        fitfunc = ui.get("fitfunc")
+        if fitfunc:
+            idx = self.cob_fit.findText(fitfunc)
+            if idx >= 0:
+                self.cob_fit.setCurrentIndex(idx)
+        x_index = ui.get("x_index", 0)
+        if 0 <= x_index < self.cob_x.count():
+            self.cob_x.setCurrentIndex(x_index)
+            self.set_x(x_index)
+        self.chk_legend.setChecked(bool(ui.get("legend", False)))
+        slice_v = ui.get("slice", 0)
+        self.scrollbar.setValue(min(slice_v, self.scrollbar.maximum()))
+        roi_sel = set(ui.get("roi_sel", [0]))
+        for i in range(self.list_roi.count()):
+            self.list_roi.item(i).setSelected(i in roi_sel)
+
+        recipes = payload.get("tabs", [])
+        self.tab_recipes = []
+        for rec in recipes:
+            try:
+                self._replay_tab_recipe(rec)
+            except Exception as exc:
+                logging.warning("Could not restore tab %s: %s", rec.get("type"), exc)
+
+        self.setWindowTitle(f"Scan Plot — {payload.get('name', zip_path.stem)}")
+        self.ed_exp_name.setText(zip_path.stem)
+        matches = self.list_experiments.findItems(zip_path.stem, Qt.MatchFlag.MatchExactly)
+        if matches:
+            self.list_experiments.setCurrentItem(matches[0])
+
+    def _replay_tab_recipe(self, rec):
+        rtype = rec.get("type")
+        # restore selection if names present
+        names = rec.get("scan_sel_names")
+        if names:
+            name_to_i = {s.name: i for i, s in enumerate(self.scans)}
+            sel = [name_to_i[n] for n in names if n in name_to_i]
+            if sel:
+                self.rebuild_scan_list_widget(select_indices=sel)
+                self.sync_primary_aliases()
+        if "roi_sel" in rec:
+            want = set(rec["roi_sel"])
+            for i in range(self.list_roi.count()):
+                self.list_roi.item(i).setSelected(i in want)
+        if "slice" in rec:
+            self.scrollbar.setValue(min(rec["slice"], self.scrollbar.maximum()))
+        if "x_index" in rec and 0 <= rec["x_index"] < self.cob_x.count():
+            self.cob_x.setCurrentIndex(rec["x_index"])
+            self.set_x(rec["x_index"])
+        if "fitfunc" in rec:
+            idx = self.cob_fit.findText(rec["fitfunc"])
+            if idx >= 0:
+                self.cob_fit.setCurrentIndex(idx)
+
+        if rtype == "export":
+            self.export_plot()
+        elif rtype == "2d":
+            self.two_d_plot()
+        elif rtype == "heatmap":
+            self.generate_heatmap(recipe=rec)
+        elif rtype == "batch":
+            self.batch_fit_selected(recipe=rec)
+        else:
+            logging.warning("Unknown tab recipe type: %s", rtype)
+
+    def copy_widget_to_clipboard(self, widget):
+        """Copy a QWidget grab to the Windows clipboard as a DIB."""
+        qimg = widget.grab().toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        ptr = qimg.bits()
+        ptr.setsize(qimg.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(qimg.height(), qimg.width(), 4)
+        img = Image.fromarray(arr[:, :, :3].copy(), "RGB")
         output = io.BytesIO()
         img.save(output, "BMP")
-        data = output.getvalue()[14:]  # remove BMP header
+        data = output.getvalue()[14:]
         output.close()
-
         win32clipboard.OpenClipboard()
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
@@ -2023,7 +2782,7 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv[:1])
 
     window = ScanPlotApplet(dummy(), None)
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 

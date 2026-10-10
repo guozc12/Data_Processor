@@ -1,0 +1,5 @@
+Module: Sr static tweezer.sisyphus_689_detuning_cooling, Module: Sr static tweezer.sisyphus_689_power_cooling, Module: Sr static tweezer.post_delay_time
+-4000000.0, 0.0001, 0.02
+-4000000.0, 0.0005, 0.02
+-100000.0, 0.0001, 0.02
+-100000.0, 0.0005, 0.02
