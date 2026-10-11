@@ -1,9 +1,0 @@
-1. experiments 目前不能rename。 另外，现在双击打开一个新的experiment，并不会提示是否要save或者不save现在的experiment。
-2. Curve 窗口不能被关掉，也没法从某个button打开。本质上curve窗口就是plot最原始的数据，可以考虑在某个地方加一个button
-3. Refresh button在loaded scans，这个button目前只refresh Curve窗口。告诉我这个button的function具体做了什么。注册在某个experiment下面的scans是在import的时候就变了，还是在refresh的时候？
-4. Dimenstion里面有个选项是mean，这个做了什么？怎么感觉没什么用
-5. Loaded scans在import之后可以自动按照name重排下
-6. Experiment里面的load button没什么用，双击就可以打开了。
-7. Experiment里面应该添加一个buttun New， 让用户可以新开一个experiment
-8. Experiment的refresh button是做什么的？讨论下
-9. 

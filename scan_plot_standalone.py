@@ -306,9 +306,38 @@ CURVES_X_TIME = "time"
 DIM_MODE_ONE = "one"
 DIM_MODE_MULTI = "multi"
 DIM_MODE_ALL = "all"
-DIM_MODE_MEAN = "mean"
+DIM_MODE_MEAN = "mean"  # legacy; Dimensions no longer offers it
 DIM_MODES = (DIM_MODE_ONE, DIM_MODE_MULTI, DIM_MODE_ALL, DIM_MODE_MEAN)
 Y_CHANNEL_MEASUREMENT = "measurement"
+
+
+def coerce_dim_mode(mode):
+    """Mean used to match All on XY curves. Keep old files on All."""
+    if mode == DIM_MODE_MEAN:
+        return DIM_MODE_ALL
+    return mode
+
+
+def coerce_encoding(enc):
+    if not isinstance(enc, dict):
+        return enc
+    dims = enc.get("dims")
+    if isinstance(dims, dict):
+        for state in dims.values():
+            if isinstance(state, dict) and state.get("mode") == DIM_MODE_MEAN:
+                state["mode"] = DIM_MODE_ALL
+    return enc
+
+
+def coerce_recipe(rec):
+    if not isinstance(rec, dict):
+        return
+    for key in ("source_encoding", "result_encoding"):
+        if isinstance(rec.get(key), dict):
+            coerce_encoding(rec[key])
+    parent = rec.get("parent")
+    if isinstance(parent, dict):
+        coerce_recipe(parent)
 
 
 def dim_id_axis(i: int) -> str:
@@ -686,7 +715,7 @@ class EncodingPanel(QWidget):
 
         self.dim_hdr = QLabel("Dimensions")
         self.dim_hdr.setStyleSheet(f"font-weight: 600; color: {THEME['text']};")
-        self.dim_hdr.setToolTip("Other dimensions: One / Multi / All / Mean")
+        self.dim_hdr.setToolTip("Other dimensions: One / Multi / All")
         root.addWidget(self.dim_hdr)
 
         self.dim_host = QWidget()
@@ -889,9 +918,7 @@ class EncodingPanel(QWidget):
             if did in skip_ids:
                 continue
             st = dims_state.get(did) or {}
-            mode = st.get("mode") or (
-                DIM_MODE_MEAN if did.startswith("axis:") else DIM_MODE_ALL
-            )
+            mode = coerce_dim_mode(st.get("mode") or DIM_MODE_ALL)
             x_dim = encoding.get("x_dim") or self.cob_x.currentData()
             if did.startswith("axis:") and parse_dim_id(x_dim or "")[0] == "axis" and not st:
                 mode = DIM_MODE_ONE
@@ -919,7 +946,6 @@ class EncodingPanel(QWidget):
                     (DIM_MODE_ONE, "One"),
                     (DIM_MODE_MULTI, "Multi"),
                     (DIM_MODE_ALL, "All"),
-                    (DIM_MODE_MEAN, "Mean"),
                 ):
                     cob_mode.addItem(lab, m)
             mi = cob_mode.findData(mode)
@@ -2637,6 +2663,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self._clean_scan_names = []
         self._refreshing_dock = None
         self._active_view_state = None
+        self._clean_fingerprint = None
+        self._scans_fp_key = None
+        self._scans_fp_val = None
+        self._syncing_curves_button = False
         self.metadata = {"key_sets": [], "points": [], "function": ""}
         self.data = []
         self.plots = Plots(0)
@@ -2655,6 +2685,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.setWindowTitle("Scan Plot")
         self.set_focused_dock(self.curves_dock)
         self.skip = False
+        self._mark_clean()
+        self._update_loaded_header()
 
     def _rebuild_main_layout(self):
         """Dockable Curves / analysis / browser panels (no global Analyze toolbar)."""
@@ -2719,6 +2751,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         curves_outer.setContentsMargins(0, 0, 0, 0)
         curves_outer.setSpacing(0)
         self.curves_dock = PlotDock("Curves", "curves", curves_page, parent=self, closable=False)
+        # Close button hides this dock; _closable stays false so it is not destroyed.
+        self.curves_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
         # saveState matches docks by objectName. id(self) changes every process.
         self.curves_dock.setObjectName("PlotDock_curves")
         self.curves_dock.activated.connect(self.set_focused_dock)
@@ -2804,12 +2842,20 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.bt_delete_scans = QPushButton("Delete")
         self.bt_delete_scans.setToolTip("Remove selected scans from this experiment (files on disk stay)")
         self.bt_refresh_plots = QPushButton("Refresh")
-        self.bt_refresh_plots.setToolTip("Redraw every plot from the scans in this list")
+        self.bt_refresh_plots.setToolTip(
+            "Redraw plots from the scans already in this list. Does not add, remove, or reread scans."
+        )
+        self.bt_curves = QPushButton("Curves")
+        self.bt_curves.setCheckable(True)
+        self.bt_curves.setToolTip("Show or hide the Curves window (raw measurements)")
+        self.bt_curves.toggled.connect(self._on_curves_button_toggled)
+        self.curves_dock.visibilityChanged.connect(self._sync_curves_button)
         self.bt_delete_scans.clicked.connect(self._delete_loaded_scans)
         self.bt_refresh_plots.clicked.connect(self.refresh_all_plots)
         data_btn_row.addWidget(self.bt_import)
         data_btn_row.addWidget(self.bt_delete_scans)
         data_btn_row.addWidget(self.bt_refresh_plots)
+        data_btn_row.addWidget(self.bt_curves)
         data_layout.addLayout(data_btn_row)
 
         exp_box = QWidget()
@@ -2830,14 +2876,16 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         name_row.addWidget(self.ed_exp_name, stretch=1)
         exp_layout.addLayout(name_row)
         exp_btn_row = QHBoxLayout()
+        self.bt_new_exp = QPushButton("New")
+        self.bt_new_exp.setToolTip("Start a new empty experiment")
         self.bt_save_exp = QPushButton("Save")
-        self.bt_open_exp = QPushButton("Load")
         self.bt_refresh_exp = QPushButton("Refresh")
+        self.bt_refresh_exp.setToolTip("Rescan the experiments folder for zip files")
+        self.bt_new_exp.clicked.connect(self.new_experiment)
         self.bt_save_exp.clicked.connect(self.save_experiment)
-        self.bt_open_exp.clicked.connect(self.open_experiment)
         self.bt_refresh_exp.clicked.connect(self.refresh_experiment_list)
+        exp_btn_row.addWidget(self.bt_new_exp)
         exp_btn_row.addWidget(self.bt_save_exp)
-        exp_btn_row.addWidget(self.bt_open_exp)
         exp_btn_row.addWidget(self.bt_refresh_exp)
         exp_layout.addLayout(exp_btn_row)
 
@@ -2985,6 +3033,22 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         # Defer until after Qt applies show(); otherwise width stays ~sliver
         QTimer.singleShot(0, self._relayout_main_docks)
 
+    def _sync_curves_button(self, visible):
+        btn = getattr(self, "bt_curves", None)
+        if btn is None:
+            return
+        self._syncing_curves_button = True
+        btn.setChecked(bool(visible))
+        self._syncing_curves_button = False
+
+    def _on_curves_button_toggled(self, checked):
+        if self._syncing_curves_button:
+            return
+        if checked:
+            self._show_curves_dock()
+        else:
+            self.curves_dock.hide()
+
     def rename_dock(self, dock):
         if dock is None:
             return
@@ -3116,18 +3180,21 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         # Legend add/remove changes the plot box after this redraw. Restyle
         # once the layout has settled so fonts and strokes match that width.
         self._schedule_journal_rescale(dock)
+        self._update_loaded_header()
 
     def _dock_set_errorbars(self, dock, checked):
         self.set_focused_dock(dock)
         dock.state.show_errorbars = bool(checked)
         dock.state.style["show_errorbars"] = bool(checked)
         self._redraw_dock(dock)
+        self._update_loaded_header()
 
     def _dock_set_style(self, dock, mode):
         self.set_focused_dock(dock)
         dock.state.style["mode"] = mode
         dock.state.style["linewidth"] = journal_linewidth_value(dock.state.style)
         self._redraw_dock(dock)
+        self._update_loaded_header()
 
     def _dock_apply_style_panel(self, dock):
         """Copy Journal / Column / axis labels from the dock's Style panel."""
@@ -3151,6 +3218,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         dock.state.xlabel = panel.ed_xlabel.text().strip()
         dock.state.ylabel = panel.ed_ylabel.text().strip()
         self._redraw_dock(dock)
+        self._update_loaded_header()
 
     def _dock_apply_ctrls(self, dock):
         """Copy journal / labels from a dock control bar (export, 2D, batch)."""
@@ -3174,6 +3242,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if getattr(ctrls, "ed_ylabel", None):
             dock.state.ylabel = ctrls.ed_ylabel.text().strip()
         self._redraw_dock(dock)
+        self._update_loaded_header()
 
     def _dock_set_colorbar(self, dock):
         """Apply Style panel colorbar Auto/Min/Max to the focused image dock."""
@@ -3200,10 +3269,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 if cbar is not None and hasattr(cbar, "setLevels"):
                     cbar.setLevels((lo, hi))
                 self.statusBar().showMessage(f"Colorbar: {lo:g} … {hi:g}", 2500)
+                self._update_loaded_header()
                 return
             except Exception:
                 pass
         self._redraw_dock(dock)
+        self._update_loaded_header()
 
     def _dock_set_fitfunc(self, dock, func):
         self.set_focused_dock(dock)
@@ -3214,6 +3285,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             enc = dock.state.encoding or {}
             if enc.get("plot_type") == "roi_grid":
                 self.draw_plot()
+        self._update_loaded_header()
 
     def _sync_encoding_fit_params(self):
         panel = getattr(self, "curves_encoding_panel", None)
@@ -3489,6 +3561,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.tab_recipes.append(recipe)
         if dock is not None:
             dock.state.recipe = recipe
+        self._update_loaded_header()
 
     def _clear_analysis_tabs(self):
         for dock in list(self.plot_docks):
@@ -3512,6 +3585,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         dock.deleteLater()
         if self._focused_dock is dock:
             self.set_focused_dock(self.curves_dock)
+        self._update_loaded_header()
 
     def _on_plot_dock_closed(self, dock):
         self._close_plot_dock(dock)
@@ -4016,7 +4090,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         return glw
 
     def closeEvent(self, event):
-        #mainly just prevents a warning in artiq when closing applet
+        # QuitOnLastWindowClosed is false, so declining must ignore the event
+        # and must not call quit().
+        if not self._confirm_discard_or_save():
+            event.ignore()
+            return
         QApplication.instance().quit()
         event.accept()
 
@@ -4234,6 +4312,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             return
         catalog = self._cube_dim_catalog()
         enc = self.curves_dock.state.encoding or default_encoding()
+        coerce_encoding(enc)
         if catalog and enc.get("x_dim") not in {d["id"] for d in catalog}:
             enc["x_dim"] = catalog[0]["id"]
         # Seed defaults for missing dims
@@ -4248,7 +4327,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 elif d["id"] == "scan":
                     dims[d["id"]] = {"mode": DIM_MODE_ALL, "values": []}
                 elif parse_dim_id(x_dim)[0] in ("roi", "scan") and d["id"].startswith("axis:"):
-                    dims[d["id"]] = {"mode": DIM_MODE_MEAN, "values": []}
+                    dims[d["id"]] = {"mode": DIM_MODE_ALL, "values": []}
                 else:
                     dims[d["id"]] = {
                         "mode": DIM_MODE_ONE,
@@ -4277,6 +4356,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if panel is None:
             return
         enc = panel.read_encoding()
+        coerce_encoding(enc)
         # Returning to XY after 2D/ROI-grid: restore saved/default ROI selection
         if (enc.get("plot_type") or "xy") == "xy":
             dims = enc.setdefault("dims", {})
@@ -4307,11 +4387,13 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not drew:
             self.draw_plot()
             self.set_title()
+        self._update_loaded_header()
 
     def _sync_legacy_from_encoding(self, enc):
         """Bridge universal encoding → cob_x / cob_curves_x / curves_dim_state / list_roi."""
         if not enc:
             return False
+        coerce_encoding(enc)
         x_dim = enc.get("x_dim") or "axis:0"
         kind, axis_i = parse_dim_id(x_dim)
         dims = enc.get("dims") or {}
@@ -4511,7 +4593,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         """When X is ROI/scan: how to expand the curve axis (pulse_detuning etc.).
 
         Returns list of x_pick values:
-          - [None] = Mean (collapse whole curve)
           - [v] = One value
           - [v1, v2, ...] = All/Multi unique curve-axis values
         """
@@ -4519,12 +4600,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if kind not in (CURVES_X_ROI, CURVES_X_TIME):
             return [None]
         i = self._fit_along_index()
-        st = self.curves_dim_state.get(f"fit:{i}", {"mode": "mean"})
-        mode = st.get("mode") or "mean"
+        st = self.curves_dim_state.get(f"fit:{i}", {"mode": "all"})
+        mode = coerce_dim_mode(st.get("mode") or "all")
         if mode == "one":
             return [st.get("value")]
-        if mode == "mean":
-            return [None]
         # all / multi → unique values along curve axis from scan data
         vals = self._unique_axis_values(scan, i)
         if mode == "multi":
@@ -4791,16 +4870,25 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.clear_scans()
 
     def _experiments_context_menu(self, pos):
+        item = self.list_experiments.itemAt(pos)
+        if item is not None:
+            self.list_experiments.setCurrentItem(item)
         menu = QMenu(self)
         act_open = menu.addAction("Open")
+        act_rename = menu.addAction("Rename…")
         act_dup = menu.addAction("Duplicate")
         act_del = menu.addAction("Delete…")
         act_reveal = menu.addAction("Reveal in folder")
         menu.addSeparator()
         act_refresh = menu.addAction("Refresh")
+        has_item = item is not None
+        for act in (act_open, act_rename, act_dup, act_del, act_reveal):
+            act.setEnabled(has_item)
         chosen = menu.exec(self.list_experiments.mapToGlobal(pos))
         if chosen is act_open:
             self.open_experiment()
+        elif chosen is act_rename:
+            self._rename_experiment()
         elif chosen is act_dup:
             self._duplicate_experiment()
         elif chosen is act_del:
@@ -4809,6 +4897,42 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self._reveal_experiment()
         elif chosen is act_refresh:
             self.refresh_experiment_list()
+
+    def _rename_experiment(self):
+        src = self._selected_experiment_path()
+        if src is None or not src.is_file():
+            QMessageBox.warning(self, "Rename", "Select an experiment zip first.")
+            return
+        name, ok = QInputDialog.getText(self, "Rename experiment", "Name:", text=src.stem)
+        if not ok:
+            return
+        name = re.sub(r'[<>:"/\\|?*]', "_", name.strip())
+        if not name or name == src.stem:
+            return
+        dest = EXPERIMENTS_DIR / f"{name}.zip"
+        if dest.exists():
+            ans = QMessageBox.question(
+                self, "Overwrite?",
+                f"{dest.name} already exists. Overwrite?",
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            if dest.exists():
+                dest.unlink()
+            src.rename(dest)
+        except Exception as exc:
+            logging.exception("Rename experiment failed")
+            QMessageBox.critical(self, "Rename failed", str(exc))
+            return
+        if self._experiment_name == src.stem:
+            self._experiment_name = name
+            self.setWindowTitle(f"Scan Plot — {name}")
+            self._update_loaded_header()
+        self.refresh_experiment_list()
+        matches = self.list_experiments.findItems(name, Qt.MatchFlag.MatchExactly)
+        if matches:
+            self.list_experiments.setCurrentItem(matches[0])
 
     def _duplicate_experiment(self):
         src = self._selected_experiment_path()
@@ -5750,6 +5874,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             dock.state.fit_overlays = []
             self._redraw_dock(dock)
         self.statusBar().showMessage("Fit cleared", 2000)
+        self._update_loaded_header()
 
     def _series_xy_for_fit(self, scan, slice_index, roi):
         """Return cleaned x, y, errors ready for curve_fit."""
@@ -5802,6 +5927,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self._perform_fit_batch_panels(dock, func, guess, fixed)
         else:
             self._perform_fit_snapshot(dock, func, guess, fixed)
+        self._update_loaded_header()
 
     def _cache_derived_points_as_xy(self, dock):
         """Build cached_xy from derived_points for snapshot Fit/Export."""
@@ -8107,6 +8233,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if panel is None:
             return
         enc = panel.read_encoding()
+        coerce_encoding(enc)
         prev = dock.state.encoding or {}
         enc["y_channel"] = prev.get("y_channel") or Y_CHANNEL_MEASUREMENT
         # Changing X on a Derive dock must rebuild points for that outer dim
@@ -8145,6 +8272,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 self._recompute_derived_fit_points(dock, new_x)
         dock.state.encoding = enc
         self._redraw_universal_dock(dock)
+        self._update_loaded_header()
 
     def _redraw_universal_dock(self, dock):
         """Draw XY / 2D / ROI-grid for a universal plotter dock."""
@@ -8534,14 +8662,136 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
     def _membership_dirty(self):
         return [s.name for s in self.scans] != list(self._clean_scan_names)
 
+    def _scans_fingerprint(self):
+        key = tuple(id(scan) for scan in self.scans)
+        if key == getattr(self, "_scans_fp_key", None):
+            return self._scans_fp_val
+        blob = json.dumps(
+            [self._scan_to_serializable(scan) for scan in self.scans],
+            sort_keys=True,
+            default=str,
+        )
+        self._scans_fp_key = key
+        self._scans_fp_val = blob
+        return blob
+
+    def _experiment_fingerprint(self):
+        curves = self.curves_dock.state
+        view = {
+            "encoding": coerce_encoding(copy.deepcopy(curves.encoding or {})),
+            "style": copy.deepcopy(curves.style),
+            "xlabel": curves.xlabel or "",
+            "ylabel": curves.ylabel or "",
+            "legend": bool(curves.show_legend),
+            "errorbars": bool(curves.show_errorbars),
+            "fitfunc": self._curves_fitfunc(),
+            "refit": bool(self._any_scan_has_fit()),
+            "x_index": self.cob_x.currentIndex() if self.cob_x.count() else 0,
+            "colorbar_auto": bool(curves.colorbar_auto),
+            "colorbar_vmin": curves.colorbar_vmin,
+            "colorbar_vmax": curves.colorbar_vmax,
+            "scans": self._scans_fingerprint(),
+            "recipes": self._recipes_for_save(),
+        }
+        return json.dumps(view, sort_keys=True, default=str)
+
+    def _experiment_dirty(self):
+        clean = getattr(self, "_clean_fingerprint", None)
+        if clean is None:
+            return False
+        try:
+            return self._experiment_fingerprint() != clean
+        except Exception:
+            logging.exception("Could not compare experiment state")
+            return True
+
+    def _mark_clean(self):
+        try:
+            self._clean_fingerprint = self._experiment_fingerprint()
+        except Exception:
+            logging.exception("Could not snapshot experiment state")
+            self._clean_fingerprint = None
+        self._clean_scan_names = [s.name for s in self.scans]
+
     def _update_loaded_header(self):
         label = getattr(self, "lb_experiment_title", None)
         if label is None:
             return
         name = self._experiment_name or "Unsaved"
-        if self._membership_dirty():
+        if self._experiment_dirty():
             name = f"{name} *"
         label.setText(name)
+
+    def _confirm_discard_or_save(self):
+        """Save / Don't Save / Cancel. True means the caller may replace or quit."""
+        if not self._experiment_dirty():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Save experiment")
+        box.setText("The current experiment has unsaved changes. Save them?")
+        btn_save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        btn_discard = box.addButton("Don't Save", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_save)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_save:
+            return self._save_current_experiment()
+        if clicked is btn_discard:
+            return True
+        return False
+
+    def _save_current_experiment(self):
+        """Save the open experiment, not whatever the Name box currently shows."""
+        name = (self._experiment_name or "").strip()
+        if not name:
+            name, ok = QInputDialog.getText(self, "Save experiment", "Name:")
+            if not ok:
+                return False
+            name = name.strip()
+        if not name:
+            return False
+        return self._write_experiment(name)
+
+    def _prompt_new_experiment_name(self):
+        """Ask for a new experiment name. None if the user cancels."""
+        while True:
+            name, ok = QInputDialog.getText(self, "New experiment", "Name:")
+            if not ok:
+                return None
+            name = re.sub(r'[<>:"/\\|?*]', "_", name.strip())
+            if not name:
+                QMessageBox.warning(self, "New experiment", "Enter a name.")
+                continue
+            dest = EXPERIMENTS_DIR / f"{name}.zip"
+            if dest.exists():
+                QMessageBox.warning(
+                    self, "New experiment",
+                    f"{name} already exists. Choose another name.",
+                )
+                continue
+            return name
+
+    def new_experiment(self):
+        name = self._prompt_new_experiment_name()
+        if not name:
+            return
+        if not self._confirm_discard_or_save():
+            return
+        self.clear_scans()
+        if not self.curves_dock.isHidden():
+            self.curves_dock.hide()
+        self.setWindowTitle(f"Scan Plot — {name}")
+        self.curves_dock.state.encoding = default_encoding()
+        self.curves_dock.state.xlabel = ""
+        self.curves_dock.state.ylabel = ""
+        self._populate_curves_encoding()
+        self.list_experiments.clearSelection()
+        self._experiment_name = name
+        self.ed_exp_name.setText(name)
+        self._mark_clean()
+        self._update_loaded_header()
 
     def _loaded_scans_context_menu(self, pos):
         menu = QMenu(self)
@@ -8964,10 +9214,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
     def _recipes_for_save(self):
         for dock in self.plot_docks:
             rec = dock.state.recipe
-            if isinstance(rec, dict):
-                rec["xlabel"] = dock.state.xlabel
-                rec["ylabel"] = dock.state.ylabel
-                rec["style"] = copy.deepcopy(dock.state.style)
+            if not isinstance(rec, dict) or dock is self.curves_dock:
+                continue
+            rec["xlabel"] = dock.state.xlabel
+            rec["ylabel"] = dock.state.ylabel
+            rec["style"] = copy.deepcopy(dock.state.style)
+            if isinstance(dock.state.encoding, dict):
+                rec["result_encoding"] = coerce_encoding(copy.deepcopy(dock.state.encoding))
+            rec["refit"] = bool(self._dock_has_fit(dock))
+            if dock.state.fitfunc:
+                rec["view_fitfunc"] = dock.state.fitfunc
+            rec["colorbar_auto"] = bool(dock.state.colorbar_auto)
+            rec["colorbar_vmin"] = dock.state.colorbar_vmin
+            rec["colorbar_vmax"] = dock.state.colorbar_vmax
         kept = []
         for rec in self.tab_recipes:
             pruned = self._prune_recipe(rec)
@@ -9263,6 +9522,48 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         finally:
             painter.end()
 
+    @staticmethod
+    def _parameter_signature(scan):
+        """Scanned parameters. Same signature can share one Curves plot."""
+        keys = (getattr(scan, "metadata", None) or {}).get("key_sets") or []
+        return tuple(tuple(str(part) for part in (key or ())) for key in keys)
+
+    @staticmethod
+    def _parameter_label(signature, *, full=False):
+        if not signature:
+            return "(no parameters)"
+        if full:
+            return ", ".join(".".join(key) if key else "?" for key in signature)
+        return ", ".join((key[-1] if key else "?") for key in signature)
+
+    def _reject_incompatible_import(self, existing, incoming):
+        """Refuse the whole import when parameters cannot share one plot."""
+        groups = {}
+        for scan in list(existing) + list(incoming):
+            groups.setdefault(self._parameter_signature(scan), []).append(scan)
+        if len(groups) <= 1:
+            return False
+        loaded_ids = {id(scan) for scan in existing}
+        labels = [self._parameter_label(sig) for sig in groups]
+        use_full = len(labels) != len(set(labels))
+        lines = [
+            "These scans use different parameters, so they cannot be plotted together.",
+            "Nothing was imported.",
+            "",
+        ]
+        for sig, members in groups.items():
+            lines.append(self._parameter_label(sig, full=use_full) + ":")
+            shown = members[:8]
+            for scan in shown:
+                state = "already loaded" if id(scan) in loaded_ids else "selected"
+                lines.append(f"  {self._scan_short_name(scan)} ({state})")
+            extra = len(members) - len(shown)
+            if extra:
+                lines.append(f"  … {extra} more")
+            lines.append("")
+        QMessageBox.warning(self, "Import scans", "\n".join(lines).rstrip())
+        return True
+
     def import_data(self):
         dialog = ScanPickerDialog(FOLDER, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -9304,13 +9605,21 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 f"Skipped {skipped} scan(s) already loaded.{fail_note}", 4000
             )
             return
+        if self._reject_incompatible_import(self.scans, unique):
+            if failures:
+                self.statusBar().showMessage(
+                    f"Import cancelled. {len(failures)} file(s) also failed to load.",
+                    4000,
+                )
+            else:
+                self.statusBar().showMessage("Import cancelled: parameters do not match.", 4000)
+            return
 
-        start = len(self.scans)
+        new_ids = {id(scan) for scan in unique}
         self.scans.extend(unique)
-        select = list(range(start, len(self.scans)))
-        # if first load, select all; if appending, select the new ones plus previous selection
-        prev = self.selected_scan_indices() if start > 0 else []
-        self.rebuild_scan_list_widget(select_indices=sorted(set(prev) | set(select)))
+        self._sort_loaded_scans("name")
+        select = [i for i, scan in enumerate(self.scans) if id(scan) in new_ids]
+        self.rebuild_scan_list_widget(select_indices=select)
         self._update_loaded_header()
         skipped_note = f" Skipped {skipped} already loaded." if skipped else ""
         self.statusBar().showMessage(
@@ -9971,18 +10280,25 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.open_experiment()
 
     def save_experiment(self):
-        if not self.scans:
-            QMessageBox.warning(self, "Save experiment", "No scans loaded.")
-            return
-        EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
         name = self.ed_exp_name.text().strip()
         if not name:
             item = self.list_experiments.currentItem()
             name = item.text() if item else ""
-        if not name.strip():
+        if not str(name).strip():
             QMessageBox.warning(self, "Save experiment", "Enter a name in the Name field.")
             return
-        name = re.sub(r'[<>:"/\\|?*]', "_", name.strip())
+        self._write_experiment(name)
+
+    def _write_experiment(self, name):
+        """Write the open experiment to experiments/<name>.zip. Returns True on success."""
+        if not self.scans:
+            QMessageBox.warning(self, "Save experiment", "No scans loaded.")
+            return False
+        EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r'[<>:"/\\|?*]', "_", str(name).strip())
+        if not name:
+            QMessageBox.warning(self, "Save experiment", "Enter a name.")
+            return False
         self.ed_exp_name.setText(name)
         zip_path = EXPERIMENTS_DIR / f"{name}.zip"
         if zip_path.exists():
@@ -9991,11 +10307,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 f"{zip_path.name} already exists. Overwrite?",
             )
             if ans != QMessageBox.StandardButton.Yes:
-                return
+                return False
 
         for dock in self.plot_docks:
             self._assign_stable_dock_object_name(dock)
         dock_layout = base64.b64encode(bytes(self.saveState())).decode("ascii")
+        curves = self.curves_dock.state
         payload = {
             "version": 2,
             "name": name,
@@ -10004,12 +10321,18 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 "x_index": self.cob_x.currentIndex(),
                 "fitfunc": self._curves_fitfunc(),
                 "slice": self.scrollbar.value(),
-                "legend": self.curves_dock.state.show_legend,
-                "style": copy.deepcopy(self.curves_dock.state.style),
-                "xlabel": self.curves_dock.state.xlabel,
-                "ylabel": self.curves_dock.state.ylabel,
+                "legend": curves.show_legend,
+                "errorbars": bool(curves.show_errorbars),
+                "style": copy.deepcopy(curves.style),
+                "xlabel": curves.xlabel,
+                "ylabel": curves.ylabel,
                 "scan_sel_names": [s.name for s in self.scans],
                 "roi_sel": self.selected_roi_indices(),
+                "encoding": coerce_encoding(copy.deepcopy(curves.encoding or {})),
+                "refit": bool(self._any_scan_has_fit()),
+                "colorbar_auto": bool(curves.colorbar_auto),
+                "colorbar_vmin": curves.colorbar_vmin,
+                "colorbar_vmax": curves.colorbar_vmax,
             },
             "scans": [self._scan_to_serializable(s) for s in self.scans],
             "tabs": self._recipes_for_save(),
@@ -10024,11 +10347,49 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             if matches:
                 self.list_experiments.setCurrentItem(matches[0])
             self._experiment_name = name
-            self._clean_scan_names = [s.name for s in self.scans]
+            self.setWindowTitle(f"Scan Plot — {name}")
+            self._mark_clean()
             self._update_loaded_header()
+            return True
         except Exception as exc:
             logging.exception("Save experiment failed")
             QMessageBox.critical(self, "Save failed", str(exc))
+            return False
+
+    def _restore_curves_encoding(self, enc):
+        if not isinstance(enc, dict) or not enc:
+            return
+        enc = coerce_encoding(copy.deepcopy(enc))
+        self.curves_dock.state.encoding = enc
+        panel = getattr(self, "curves_encoding_panel", None)
+        if panel is not None:
+            self.skip = True
+            panel.write_y_channel(enc.get("y_channel") or Y_CHANNEL_MEASUREMENT)
+            panel.set_catalog(self._cube_dim_catalog(), enc)
+            self.skip = False
+        self._sync_legacy_from_encoding(enc)
+        self.draw_plot()
+        self.set_title()
+
+    def _apply_dock_encoding(self, dock, enc):
+        if dock is None or not isinstance(enc, dict):
+            return
+        enc = coerce_encoding(copy.deepcopy(enc))
+        dock.state.encoding = enc
+        panel = getattr(dock, "encoding_panel", None)
+        if panel is None:
+            return
+        self.skip = True
+        panel.write_y_channel(enc.get("y_channel") or Y_CHANNEL_MEASUREMENT)
+        cat = list(getattr(panel, "_dim_catalog", None) or [])
+        if cat:
+            panel.set_catalog(cat, enc)
+        self.skip = False
+        if dock is self.curves_dock:
+            self._sync_legacy_from_encoding(enc)
+            self.draw_plot()
+        else:
+            self._redraw_universal_dock(dock)
 
     def open_experiment(self):
         zip_path = self._selected_experiment_path()
@@ -10038,13 +10399,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 "Select an experiment in the list (or type an existing name).",
             )
             return
-        if self._membership_dirty():
-            ans = QMessageBox.question(
-                self, "Load experiment",
-                "The current experiment has unsaved scan changes. Load anyway and replace them?",
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
+        if not self._confirm_discard_or_save():
+            return
         self.statusBar().showMessage(f"Loading {zip_path.stem}…")
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
@@ -10080,6 +10436,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.curves_dock.state.xlabel = ui.get("xlabel") or ""
         self.curves_dock.state.ylabel = ui.get("ylabel") or ""
         self.curves_dock.state.show_legend = bool(ui.get("legend", False))
+        if "errorbars" in ui:
+            self.curves_dock.state.show_errorbars = bool(ui.get("errorbars"))
+        if "colorbar_auto" in ui:
+            self.curves_dock.state.colorbar_auto = bool(ui.get("colorbar_auto", True))
+            self.curves_dock.state.colorbar_vmin = ui.get("colorbar_vmin")
+            self.curves_dock.state.colorbar_vmax = ui.get("colorbar_vmax")
         fitfunc = ui.get("fitfunc")
         if fitfunc:
             self.curves_dock.state.fitfunc = fitfunc
@@ -10137,7 +10499,13 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.list_roi.item(i).setSelected(i in roi_sel)
         self.list_roi.blockSignals(False)
 
+        saved_enc = ui.get("encoding")
+        if isinstance(saved_enc, dict) and saved_enc:
+            self._restore_curves_encoding(saved_enc)
+
         recipes = payload.get("tabs", [])
+        for rec in recipes:
+            coerce_recipe(rec)
         self.tab_recipes = []
         if recipes:
             self.statusBar().showMessage("Restoring Derive…")
@@ -10167,10 +10535,15 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             except Exception as exc:
                 logging.warning("Could not restore dock layout: %s", exc)
 
-        self.setWindowTitle(f"Scan Plot — {payload.get('name', zip_path.stem)}")
+        self.setWindowTitle(f"Scan Plot — {zip_path.stem}")
         self.ed_exp_name.setText(zip_path.stem)
         self._experiment_name = zip_path.stem
-        self._clean_scan_names = [s.name for s in self.scans]
+        if ui.get("refit"):
+            try:
+                self.perform_fit(None, func=self._curves_fitfunc(), dock=self.curves_dock)
+            except Exception:
+                logging.exception("Refit after load failed")
+        self._mark_clean()
         self._update_loaded_header()
         matches = self.list_experiments.findItems(zip_path.stem, Qt.MatchFlag.MatchExactly)
         if matches:
@@ -10441,6 +10814,20 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 dock.state.xlabel = rec.get("xlabel") or ""
             if "ylabel" in rec:
                 dock.state.ylabel = rec.get("ylabel") or ""
+            if "colorbar_auto" in rec:
+                dock.state.colorbar_auto = bool(rec.get("colorbar_auto", True))
+                dock.state.colorbar_vmin = rec.get("colorbar_vmin")
+                dock.state.colorbar_vmax = rec.get("colorbar_vmax")
+            if isinstance(rec.get("result_encoding"), dict):
+                self._apply_dock_encoding(dock, rec["result_encoding"])
+            if getattr(dock, "style_panel", None) is not None:
+                dock.style_panel.sync_from_state(dock.state)
+            if rec.get("refit") and getattr(self, "_refreshing_dock", None) is None:
+                try:
+                    func = rec.get("view_fitfunc") or dock.state.fitfunc
+                    self.perform_fit(None, func=func, dock=dock)
+                except Exception:
+                    logging.exception("Refit after restore failed")
 
 class dummy:
     def __init__(self):
