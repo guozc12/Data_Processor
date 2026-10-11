@@ -194,10 +194,10 @@ Analyze → **Clear data…**: confirm → wipe loaded scans and close analysis 
 
 Import picker: `ScanPickerDialog` with filter + sort (Name/Date).
 
-- `discover_scan_dirs` is cached for the process (`_scan_dir_cache`). The dialog paints first, then fills. A second Import in the same process does not walk `data/` again.
+- `discover_scan_dirs` is cached for the process (`_scan_dir_cache`). The dialog paints first (`Indexing…`). A cache miss walks `data/` on a background thread so the window is not an unpainted white client. A second Import in the same process does not walk again.
 - The picker's **Refresh** passes `refresh=True` and is the way to see scans written after the cache was filled. That is not the Loaded-scans Refresh.
-- The filter waits 200 ms (`_filter_timer`) before rebuilding the list. Do not connect `textChanged` straight to `apply_filter_sort`.
-- First open still walks the whole tree on the UI thread (about 2 s for ~10k folders). The list is a normal `QListWidget`, not a virtual model.
+- The filter waits 200 ms (`_filter_timer`) before rebuilding the list. Do not connect `textChanged` straight to `apply_filter_sort`. `apply_filter_sort` returns immediately while `_indexing` is true.
+- The list is a normal `QListWidget`, not a virtual model. Filling it still happens on the UI thread after the walk returns.
 
 ### Theme
 
@@ -360,7 +360,7 @@ Only do these if the user asks:
 1. Embed Average docks in the experiment zip. Fit-param docks already reload by refitting (`derive` recipe); the points themselves are still not stored.
 2. Promote derived → Loaded scans (explicit action).
 3. Full encoding shelf (explicit Color/Y channels).
-4. Import dialog virtualization. Cache and filter debounce are in place; the **first** Import of ~10k folders is still a UI-thread walk (~2 s). A virtual list only matters if that first fill or scrolling the full list becomes the problem.
+4. Import dialog virtualization. The directory walk is off the UI thread; the list is still filled in one go afterward. A virtual list only matters if that fill or scrolling the full list becomes the problem.
 5. Drop recipe+Ctrl+Q for legacy `two_d_plot` / heatmap / batch once unused.
 6. Optional module split if file size blocks work.
 7. Title rename UX polish.

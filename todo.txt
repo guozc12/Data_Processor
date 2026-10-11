@@ -1,1 +1,2 @@
-1. 
+1. ROI average 之后，然后fitting，然后有问题。
+2. scan作为一个轴，展示的时候没有统一的展示，你调查下。我希望不管在哪里都按照scan的日期和scan后面那一串HHmmss来展示

@@ -255,6 +255,70 @@ def main():
 
     run("average_roi_keeps_scan_dim", t_avg_roi_keeps_scan_dim)
 
+    def t_avg_uses_selected_values():
+        scan = make_synth_scan("avg_sel", n0=11, n1=3, n_roi=4)
+        peak = 5  # gaussian center; ROI amplitudes differ here
+        reduced = win._average_scans_over_dims([scan], ["roi"], keep={"roi": [0, 2]})[0]
+        expect = (scan.data[peak][0][1] + scan.data[peak][2][1]) / 2
+        got = reduced.data[peak][0][1]
+        if abs(got - expect) > 1e-6:
+            raise AssertionError((got, expect))
+        all4 = sum(scan.data[peak][r][1] for r in range(4)) / 4
+        if abs(got - all4) < 1e-4:
+            raise AssertionError("ROI average included unselected ROIs")
+        reduced_ax = win._average_scans_over_dims(
+            [scan], ["axis:1"], keep={"axis:1": [0.0, 2.0]},
+        )[0]
+        if len(reduced_ax.data) != 11:
+            raise AssertionError(len(reduced_ax.data))
+        j0 = scan.data[peak][0][1]
+        j2 = scan.data[2 * 11 + peak][0][1]
+        scan.data[11 + peak][0][1] = 0
+        reduced_ax = win._average_scans_over_dims(
+            [scan], ["axis:1"], keep={"axis:1": [0.0, 2.0]},
+        )[0]
+        expect_ax = (j0 + j2) / 2
+        got_ax = reduced_ax.data[peak][0][1]
+        if abs(got_ax - expect_ax) > 1e-6:
+            raise AssertionError((got_ax, expect_ax, (j0 + j2) / 3))
+
+        other = make_synth_scan("avg_sel_b", n0=11, n1=3, n_roi=4)
+        for row in other.data:
+            for cell in row:
+                cell[1] += 50
+        load_win_with_scans(win, [scan, other])
+        set_type(win, "xy")
+        enc = win.curves_encoding_panel.read_encoding()
+        enc["x_dim"] = "axis:0"
+        enc["dims"] = {
+            "roi": {"mode": sp.DIM_MODE_MULTI, "values": [0, 2]},
+            "axis:1": {"mode": sp.DIM_MODE_ALL, "values": []},
+            "scan": {"mode": sp.DIM_MODE_ONE, "values": [0]},
+        }
+        win.curves_dock.state.encoding = enc
+        win.curves_encoding_panel.set_catalog(win._cube_dim_catalog(), enc)
+        original = sp.AverageDimsDialog.exec
+
+        def auto_exec(self):
+            for c in self._checks:
+                c.setChecked(c.property("dim_id") == "roi")
+            return QDialog.DialogCode.Accepted
+
+        sp.AverageDimsDialog.exec = auto_exec
+        try:
+            win.average_cube_dims(dock=win.curves_dock)
+            dock = win.plot_docks[-1]
+            if len(dock.state.derived_scans) != 1:
+                raise AssertionError(len(dock.state.derived_scans))
+            got = dock.state.derived_scan.data[peak][0][1]
+            if abs(got - expect) > 1e-6:
+                raise AssertionError((got, expect))
+        finally:
+            sp.AverageDimsDialog.exec = original
+            load_win_with_scans(win, [s1, s2])
+
+    run("average_uses_selection", t_avg_uses_selected_values)
+
     def t_avg_x_axis_and_drop_from_sidebar():
         """Current X (axis:0) can be averaged; collapsed ROI leaves sidebar."""
         set_type(win, "xy")
@@ -613,9 +677,14 @@ def main():
              "value_labels": ["ROI 0", "ROI 1"]},
             {"id": "scan", "label": "scan", "values": [0], "value_labels": ["s0"]},
         ]
+        fit_enc = sp.default_encoding("axis:1", y_channel="fit:amp")
+        fit_enc["dims"] = {
+            "roi": {"mode": sp.DIM_MODE_ALL, "values": []},
+            "scan": {"mode": sp.DIM_MODE_ALL, "values": []},
+        }
         d = win._open_universal_plotter(
             "fit-pts", kind="derived_fit",
-            encoding=sp.default_encoding("axis:1", y_channel="fit:amp"),
+            encoding=fit_enc,
             derived_points=points, fitfunc="Gauss", catalog=cat,
         )
         original = sp.AverageDimsDialog.exec
@@ -766,14 +835,34 @@ def main():
 
         sp.os_walk_safe = counting_walk
         dlg1 = dlg2 = None
-        try:
-            t0 = time.perf_counter()
-            dlg1 = sp.ScanPickerDialog(ROOT / "data")
-            dlg1.show()
-            for _ in range(20):
+
+        def wait_picker(dlg, timeout=90):
+            deadline = time.perf_counter() + timeout
+            while time.perf_counter() < deadline:
                 app.processEvents()
-                if dlg1.list_widget.count():
-                    break
+                if (not dlg._indexing) and dlg.list_widget.count() >= 1000:
+                    return
+                QTest.qWait(30)
+            raise AssertionError(
+                f"import list not ready: indexing={dlg._indexing} "
+                f"count={dlg.list_widget.count()} label={dlg.lb_count.text()!r}"
+            )
+
+        try:
+            dlg1 = sp.ScanPickerDialog(ROOT / "data")
+            t0 = time.perf_counter()
+            dlg1.show()
+            app.processEvents()
+            t_open = time.perf_counter() - t0
+            # The cold walk must not run inside this first turn. That turn used
+            # to block for seconds and Windows painted a white client area.
+            if t_open > 0.5:
+                raise AssertionError(
+                    f"import dialog blocked for {t_open:.2f}s before returning to the event loop"
+                )
+            if not dlg1._indexing and dlg1.list_widget.count() < 1000:
+                raise AssertionError("cold import neither indexed nor filled the list")
+            wait_picker(dlg1)
             t_cold = time.perf_counter() - t0
             if dlg1.list_widget.count() < 1000:
                 raise AssertionError(f"import list too small: {dlg1.list_widget.count()}")
@@ -783,10 +872,7 @@ def main():
             t0 = time.perf_counter()
             dlg2 = sp.ScanPickerDialog(ROOT / "data")
             dlg2.show()
-            for _ in range(20):
-                app.processEvents()
-                if dlg2.list_widget.count():
-                    break
+            wait_picker(dlg2)
             t_warm = time.perf_counter() - t0
             if walks["n"] != 1:
                 raise AssertionError(f"warm import walked again (total {walks['n']})")
@@ -978,6 +1064,242 @@ def main():
             sp.EXPERIMENTS_DIR = orig_dir
 
     run("load_confirms_unsaved", t_load_confirm)
+
+    def t_load_clock_experiment_draws_once():
+        """A large saved experiment must draw Curves once, with a loading status."""
+        zip_path = ROOT / "experiments" / "clock spectrum long scan.zip"
+        if not zip_path.is_file():
+            raise AssertionError(f"missing {zip_path}")
+        win._clean_scan_names = [s.name for s in win.scans]
+        win.refresh_experiment_list()
+        matches = win.list_experiments.findItems(
+            "clock spectrum long scan", sp.Qt.MatchFlag.MatchExactly,
+        )
+        if not matches:
+            raise AssertionError("experiment is not in the list")
+        win.list_experiments.setCurrentItem(matches[0])
+        messages = []
+        orig_msg = win.statusBar().showMessage
+        draws = {"n": 0}
+        orig_draw = win.draw_plot
+
+        def counting_draw():
+            draws["n"] += 1
+            return orig_draw()
+
+        def recording_msg(text, timeout=0):
+            messages.append(text)
+            return orig_msg(text, timeout)
+
+        win.draw_plot = counting_draw
+        win.statusBar().showMessage = recording_msg
+        try:
+            t0 = time.perf_counter()
+            win.open_experiment()
+            for _ in range(8):
+                app.processEvents()
+            elapsed = time.perf_counter() - t0
+        finally:
+            win.draw_plot = orig_draw
+            win.statusBar().showMessage = orig_msg
+
+        if draws["n"] != 1:
+            raise AssertionError(f"draw_plot called {draws['n']} times")
+        if not any(m.startswith("Loading ") for m in messages):
+            raise AssertionError(f"no loading status: {messages[:4]}")
+        if len(win.scans) < 100:
+            raise AssertionError(f"expected the long scan, got {len(win.scans)} scans")
+        items = win.pw_plot.getPlotItem().listDataItems()
+        n_pts = 0
+        for it in items:
+            data = it.getData()
+            if data and data[0] is not None:
+                n_pts += len(data[0])
+        if n_pts < 1000:
+            raise AssertionError(
+                f"curves overlay is short: items={len(items)} points={n_pts}"
+            )
+        kinds = [d.state.kind for d in win.plot_docks]
+        if "derived_fit" not in kinds:
+            raise AssertionError(f"derive dock missing: {kinds}")
+        if elapsed > 14:
+            raise AssertionError(f"load took {elapsed:.2f}s (two full draws were ~16s)")
+        print(
+            f"TIMING clock-experiment load={elapsed:.2f}s draws={draws['n']} "
+            f"scans={len(win.scans)} series={len(win.curves_dock.state.series_items)}"
+        )
+
+    run("load_clock_experiment_once", t_load_clock_experiment_draws_once)
+
+    def t_import_dedup_and_sort():
+        early = make_synth_scan(r"2026-10-11\scan090000")
+        early.path = Path(r"D:\scans\2026-10-11\scan090000")
+        late = make_synth_scan("2026-10-11/scan120000")
+        late.path = Path(r"D:\scans\2026-10-11\scan120000")
+        load_win_with_scans(win, [early, late])
+        win._experiment_name = "dedup"
+        win._clean_scan_names = [early.name, late.name]
+        win._update_loaded_header()
+        again = make_synth_scan("2026-10-11/scan090000")
+        again.path = Path(r"D:\other\scan090000")
+        fresh = make_synth_scan("2026-10-11/scan150000")
+        fresh.path = Path(r"D:\scans\2026-10-11\scan150000")
+        same_folder = make_synth_scan("renamed")
+        same_folder.path = Path(r"D:\scans\2026-10-11\scan120000")
+        unique, skipped = win._unique_new_scans([again, fresh, same_folder, fresh])
+        if skipped != 3 or [s.name for s in unique] != ["2026-10-11/scan150000"]:
+            raise AssertionError((skipped, [s.name for s in unique]))
+        win.curves_dock.state.encoding.setdefault("dims", {})["scan"] = {
+            "mode": sp.DIM_MODE_MULTI, "values": [0],
+        }
+        draws = {"n": 0}
+        orig = win.draw_plot
+        def counting():
+            draws["n"] += 1
+            return orig()
+        win.draw_plot = counting
+        try:
+            win._sort_loaded_scans("newest")
+        finally:
+            win.draw_plot = orig
+        if draws["n"] != 0:
+            raise AssertionError("sort should not redraw")
+        if [s.name for s in win.scans] != [late.name, early.name]:
+            raise AssertionError([s.name for s in win.scans])
+        if win.curves_dock.state.encoding["dims"]["scan"]["values"] != [1]:
+            raise AssertionError(win.curves_dock.state.encoding["dims"]["scan"]["values"])
+        if not win._membership_dirty():
+            raise AssertionError("reordering should mark the experiment dirty")
+        win._sort_loaded_scans("name")
+        if [s.name for s in win.scans] != [early.name, late.name]:
+            raise AssertionError([s.name for s in win.scans])
+
+    run("import_dedup_and_sort", t_import_dedup_and_sort)
+
+    def t_scan_label_includes_date():
+        morning = make_synth_scan(r"2026-10-11\scan041501")
+        morning.path = Path(r"D:\scans\2026-10-11\scan041501")
+        next_day = make_synth_scan("scan041501")
+        next_day.path = Path(r"D:\scans\2026-10-12\scan041501")
+        load_win_with_scans(win, [morning, next_day])
+        labels = next(
+            d["value_labels"] for d in win._cube_dim_catalog() if d["id"] == "scan"
+        )
+        if labels != ["2026-10-11/scan041501", "2026-10-12/scan041501"]:
+            raise AssertionError(labels)
+        if labels[0] == labels[1]:
+            raise AssertionError("same clock time on two days must stay distinct")
+
+    run("scan_label_includes_date", t_scan_label_includes_date)
+
+    def t_scan_axis_uses_datetime():
+        early = make_synth_scan("2026-10-11/scan041501")
+        early.path = Path(r"D:\scans\2026-10-11\scan041501")
+        late = make_synth_scan("2026-10-12/scan041501")
+        late.path = Path(r"D:\scans\2026-10-12\scan041501")
+        load_win_with_scans(win, [early, late])
+        enc = win.curves_encoding_panel.read_encoding()
+        enc["x_dim"] = "scan"
+        enc.setdefault("dims", {})["roi"] = {"mode": sp.DIM_MODE_ONE, "values": [0]}
+        win.curves_dock.state.encoding = enc
+        win.curves_encoding_panel.set_catalog(win._cube_dim_catalog(), enc)
+        win._sync_legacy_from_encoding(enc)
+        win.draw_plot()
+        axis = win.pw_plot.getPlotItem().getAxis("bottom")
+        if not isinstance(axis, sp.DateAxisItem):
+            raise AssertionError(type(axis).__name__)
+        want = {win._scan_epoch(early), win._scan_epoch(late)}
+        got = set()
+        for it in win.pw_plot.getPlotItem().listDataItems():
+            data = it.getData()
+            if data and data[0] is not None:
+                got.update(round(float(x), 3) for x in np.asarray(data[0]).ravel())
+        want_r = {round(float(x), 3) for x in want}
+        if got != want_r:
+            raise AssertionError((got, want_r))
+        assembled = win._assemble_2d_axis_scan([early, late], 0, 0, enc, scan_as_y=True)
+        if assembled is None or assembled.get("time_axis") != "left":
+            raise AssertionError(assembled.get("time_axis") if assembled else None)
+        edges = np.asarray(assembled["y_edges"], dtype=float)
+        mids = (edges[:-1] + edges[1:]) / 2
+        if [round(float(v), 3) for v in mids] != [round(float(v), 3) for v in (win._scan_epoch(early), win._scan_epoch(late))]:
+            raise AssertionError(mids)
+        load_win_with_scans(win, [s1, s2])
+
+    run("scan_axis_uses_datetime", t_scan_axis_uses_datetime)
+
+    def t_point_tooltip():
+        text = sp.format_point_tip(
+            1_761_000_000.0, 0.5,
+            {"id": "2026-10-09/scan171143", "series": "ROI 7", "yerr": 0.02},
+            xlabel="scan time", ylabel="survival", x_is_time=True,
+        )
+        lines = text.splitlines()
+        if lines[:2] != ["2026-10-09/scan171143", "ROI 7"]:
+            raise AssertionError(text)
+        if not lines[2].startswith("scan time = 20"):
+            raise AssertionError(text)
+        if lines[3] != "survival = 0.5 ± 0.02":
+            raise AssertionError(text)
+        early = make_synth_scan("2026-10-11/scan041501")
+        early.path = Path(r"D:\scans\2026-10-11\scan041501")
+        late = make_synth_scan("2026-10-12/scan041501")
+        late.path = Path(r"D:\scans\2026-10-12\scan041501")
+        load_win_with_scans(win, [early, late])
+        win.curves_dock.state.show_legend = False
+        enc = win.curves_encoding_panel.read_encoding()
+        enc["x_dim"] = "scan"
+        enc.setdefault("dims", {})["roi"] = {"mode": sp.DIM_MODE_ONE, "values": [0]}
+        win.curves_dock.state.encoding = enc
+        win.curves_encoding_panel.set_catalog(win._cube_dim_catalog(), enc)
+        win._sync_legacy_from_encoding(enc)
+        win.draw_plot()
+        tips = []
+        hovered = False
+        for it in win.pw_plot.getPlotItem().listDataItems():
+            sc = getattr(it, "scatter", None)
+            if sc is None or not sc.opts.get("hoverable"):
+                continue
+            hovered = True
+            for pt in sc.points():
+                if not np.isfinite(pt.pos().x()):
+                    continue
+                tips.append(sc.opts["tip"](pt.pos().x(), pt.pos().y(), pt.data()))
+        blob = "\n".join(tips)
+        if not hovered or "2026-10-11/scan041501" not in blob or "2026-10-12/scan041501" not in blob:
+            raise AssertionError(blob or "no hoverable markers")
+        if "scan time = 2026-10-11" not in blob:
+            raise AssertionError(blob)
+        win.curves_dock.state.style["mode"] = "Line"
+        win.draw_plot()
+        for it in win.pw_plot.getPlotItem().listDataItems():
+            sc = getattr(it, "scatter", None)
+            if sc is not None and sc.opts.get("hoverable"):
+                raise AssertionError("line mode still shows point tips")
+        win.curves_dock.state.style["mode"] = "Scatter"
+        win.curves_dock.state.show_legend = True
+        load_win_with_scans(win, [s1, s2])
+
+    run("point_tooltip", t_point_tooltip)
+
+    def t_journal_date_ticks():
+        from datetime import datetime as dt
+        from PyQt6.QtGui import QFont
+        axis = sp.ScanDateAxisItem(orientation="bottom")
+        font = QFont("Arial")
+        font.setPixelSize(28)
+        axis.setStyle(tickFont=font)
+        t0 = dt(2026, 10, 9, 18).timestamp()
+        t1 = dt(2026, 10, 11, 18).timestamp()
+        axis.setRange(t0, t1)
+        texts = []
+        for spacing, ticks in axis.tickValues(t0, t1, 900):
+            texts.extend(axis.tickStrings(list(ticks), 1, spacing))
+        blob = " ".join(texts)
+        if "Sat 10" not in blob or "Sun 11" not in blob or "18:00" not in blob:
+            raise AssertionError(blob)
+
+    run("journal_date_ticks", t_journal_date_ticks)
 
     print("\n==== SUMMARY ====")
     n_fail = sum(1 for _, o in results if not o)

@@ -33,12 +33,14 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (
     QFont, QImage, QAction, QShortcut, QKeySequence, QPdfWriter, QPainter, QPageSize,
-    QPen,
+    QPen, QColor, QPalette,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QByteArray, QTimer, QSizeF, QSize, QRect, QRectF
+from PyQt6.QtCore import (
+    Qt, pyqtSignal, QByteArray, QTimer, QSizeF, QSize, QRect, QRectF, QThread,
+)
 from pyqtgraph import (
     ErrorBarItem, mkPen, mkBrush, PlotWidget, ImageItem, ColorBarItem,
-    GraphicsLayoutWidget, DateAxisItem, colormap as pg_colormap,
+    GraphicsLayoutWidget, AxisItem, DateAxisItem, colormap as pg_colormap,
 )
 from pyqtgraph.graphicsItems.LegendItem import ItemSample
 
@@ -50,6 +52,7 @@ import logging
 import io
 import re
 import copy
+import threading
 from contextlib import contextmanager
 import json
 import zipfile
@@ -99,7 +102,7 @@ OVERLAY_COLORS = [
 ]
 
 APP_STYLESHEET = f"""
-QMainWindow, QWidget {{
+QMainWindow, QDialog, QWidget {{
     background-color: {THEME["bg"]};
     color: {THEME["text"]};
 }}
@@ -421,6 +424,71 @@ def plot_kwargs_from_style(color, style=None, *, widget_px=0, symbol=None, pen_s
         "symbolPen": None,
         "symbolBrush": mkBrush(*color),
     }
+
+
+class ScanDateAxisItem(DateAxisItem):
+    """Date axis that keeps weekday and clock labels at journal font sizes.
+
+    DateAxisItem switches to month/day when the tick font is wide. Journal
+    fonts are scaled up to a physical point size, so a two-day scan then
+    shows only the day number: the month tick lies outside the data.
+    """
+
+    def setZoomLevelForDensity(self, density):
+        try:
+            span = abs(float(self.range[1]) - float(self.range[0]))
+        except Exception:
+            span = 0.0
+        if span <= 7 * 86400:
+            key = 6 * 3600
+        elif span <= 120 * 86400:
+            key = 5 * 3600 * 24
+        else:
+            key = None
+        level = self.zoomLevels.get(key) if key is not None else None
+        if level is None:
+            super().setZoomLevelForDensity(density)
+            return
+        self.zoomLevel = level
+        self.zoomLevel.utcOffset = self.utcOffset
+        size = 48.0
+        metrics = getattr(self, "fontMetrics", None)
+        if metrics is not None:
+            try:
+                size = float(metrics.boundingRect(level.exampleText).width()) + 8.0
+            except Exception:
+                pass
+        self.minSpacing = float(density) * max(size, 1.0)
+
+
+def format_point_tip(x, y, data, xlabel="", ylabel="", x_is_time=False):
+    """Text for one hovered marker: identity, then x and y."""
+    data = data if isinstance(data, dict) else {}
+    lines = []
+    ident = data.get("id") or None
+    series = data.get("series") or None
+    if ident:
+        lines.append(str(ident))
+    if series and series != ident:
+        lines.append(str(series))
+    if np.isfinite(x):
+        if x_is_time and float(x) > 1.0e8:
+            xv = datetime.fromtimestamp(float(x)).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            xv = f"{float(x):g}"
+        lines.append(f"{xlabel} = {xv}" if xlabel else xv)
+    if np.isfinite(y):
+        yerr = data.get("yerr")
+        try:
+            yerr_f = float(yerr) if yerr is not None else None
+        except (TypeError, ValueError):
+            yerr_f = None
+        if yerr_f is not None and np.isfinite(yerr_f) and yerr_f > 0:
+            yv = f"{float(y):g} ± {yerr_f:g}"
+        else:
+            yv = f"{float(y):g}"
+        lines.append(f"{ylabel} = {yv}" if ylabel else yv)
+    return "\n".join(lines)
 
 
 def link_curve_errorbar(curve, error_bar):
@@ -1103,7 +1171,8 @@ class AverageDimsDialog(QDialog):
         lay = QVBoxLayout(self)
         tip = QLabel(
             "Select any dimensions to average (including current X). "
-            "A new plot opens with those dims removed from the cube."
+            "Each one is averaged over its current One / Multi / All selection, "
+            "then removed from the cube."
         )
         tip.setWordWrap(True)
         tip.setStyleSheet(f"color: {THEME['muted']};")
@@ -1359,31 +1428,71 @@ class AnalyzePanel(QWidget):
 
 # root path -> scan dirs. Refresh on the import dialog bypasses this.
 _scan_dir_cache: dict[str, list] = {}
+_scan_dir_lock = threading.Lock()
+# Keeps index threads alive after the picker closes, so a cold walk can finish
+# and fill the cache without touching a hidden dialog.
+_index_threads: set = set()
+
+
+def _scan_root_key(root: Path) -> str:
+    try:
+        return str(Path(root).resolve())
+    except OSError:
+        return str(root)
+
+
+def cached_scan_dirs(root: Path):
+    """Copy of the process cache for root, or None if it has not been indexed."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    with _scan_dir_lock:
+        found = _scan_dir_cache.get(_scan_root_key(root))
+        return None if found is None else list(found)
 
 
 def discover_scan_dirs(root: Path, *, refresh: bool = False):
     """Return dirs under root that contain both log.csv and logResults.csv.
 
     Results are cached for this process. Pass refresh=True after new scans
-    appear on disk (Import → Refresh).
+    appear on disk (Import → Refresh). Safe to call off the UI thread; the
+    cache lock is held for the whole walk.
     """
     root = Path(root)
     if not root.is_dir():
         return []
-    try:
-        key = str(root.resolve())
-    except OSError:
-        key = str(root)
-    if not refresh and key in _scan_dir_cache:
-        return list(_scan_dir_cache[key])
-    found = []
-    for dirpath, _dirnames, filenames in os_walk_safe(root):
-        names = set(filenames)
-        if "log.csv" in names and "logResults.csv" in names:
-            found.append(Path(dirpath))
-    found.sort()
-    _scan_dir_cache[key] = found
-    return list(found)
+    key = _scan_root_key(root)
+    with _scan_dir_lock:
+        if not refresh and key in _scan_dir_cache:
+            return list(_scan_dir_cache[key])
+        found = []
+        for dirpath, _dirnames, filenames in os_walk_safe(root):
+            names = set(filenames)
+            if "log.csv" in names and "logResults.csv" in names:
+                found.append(Path(dirpath))
+        found.sort()
+        _scan_dir_cache[key] = found
+        return list(found)
+
+
+class _ScanIndexThread(QThread):
+    """Directory walk for the import picker. run() returns when the walk ends."""
+
+    indexed = pyqtSignal(int, object)
+
+    def __init__(self, root: Path, refresh: bool, generation: int):
+        super().__init__()
+        self._root = Path(root)
+        self._refresh = bool(refresh)
+        self._generation = generation
+
+    def run(self):
+        try:
+            dirs = discover_scan_dirs(self._root, refresh=self._refresh)
+        except Exception:
+            logging.exception("Could not index scan folders under %s", self._root)
+            dirs = None
+        self.indexed.emit(self._generation, dirs)
 
 
 def os_walk_safe(root: Path):
@@ -1533,6 +1642,10 @@ class ScanPickerDialog(QDialog):
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_widget.setUniformItemSizes(True)
+        # The viewport is a plain QWidget; without this it stays the default white
+        # while the rest of the dialog follows the dark stylesheet.
+        self.list_widget.viewport().setAutoFillBackground(False)
         layout.addWidget(self.list_widget)
         self.lb_count = QLabel("")
         layout.addWidget(self.lb_count)
@@ -1543,7 +1656,9 @@ class ScanPickerDialog(QDialog):
         btn_row.addWidget(csv_btn)
         btn_row.addStretch(1)
         ok_btn = QPushButton("Load")
+        ok_btn.setEnabled(False)
         ok_btn.clicked.connect(self.accept)
+        self._ok_btn = ok_btn
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(ok_btn)
@@ -1551,9 +1666,39 @@ class ScanPickerDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._indexed = []  # (label, path, timestamp) filled by refresh
+        self._indexing = False
+        self._index_gen = 0
+        self._index_thread = None
+        self._pending = None
+        self._auto_index_started = False
         self.lb_count.setText("Indexing…")
-        # Let the dialog paint before the first directory walk.
-        QTimer.singleShot(0, self.refresh)
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(THEME["bg"]))
+        pal.setColor(QPalette.ColorRole.Base, QColor(THEME["panel"]))
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Paint the chrome before the first event-loop turn. A cold index used
+        # to run on that turn and Windows showed an unpainted white client.
+        self.repaint()
+        if not self._auto_index_started:
+            self._auto_index_started = True
+            QTimer.singleShot(0, self._initial_refresh)
+
+    def hideEvent(self, event):
+        # Accept/Cancel hide the dialog without closeEvent. Drop in-flight
+        # results so a late signal cannot rebuild the list after Load.
+        self._filter_timer.stop()
+        self._index_gen += 1
+        self._pending = None
+        self._indexing = False
+        super().hideEvent(event)
+
+    def _initial_refresh(self):
+        if self.isVisible():
+            self.refresh(rescan=False)
 
     def browse_root(self):
         path = QFileDialog.getExistingDirectory(self, "Scan root folder", str(self.root))
@@ -1563,17 +1708,71 @@ class ScanPickerDialog(QDialog):
             self.refresh()
 
     def refresh(self, rescan=False):
+        if not self.isVisible():
+            return
         self._csv_pair = None
         self._filter_timer.stop()
-        self._all_dirs = discover_scan_dirs(self.root, refresh=bool(rescan))
+        self._index_gen += 1
+        gen = self._index_gen
+        self.list_widget.clear()
+        self._ok_btn.setEnabled(False)
+        self.lb_count.setText("Indexing…")
+        self.repaint()
+        cached = None if rescan else cached_scan_dirs(self.root)
+        if cached is not None:
+            self._pending = None
+            self._install_dirs(cached)
+            return
+        self._indexing = True
+        self._pending = (Path(self.root), bool(rescan), gen)
+        self._pump_index()
+
+    def _pump_index(self):
+        thread = self._index_thread
+        if thread is not None and thread.isRunning():
+            return
+        pending = self._pending
+        if pending is None:
+            return
+        root, rescan, gen = pending
+        if gen != self._index_gen:
+            self._pending = None
+            return
+        self._pending = None
+        thread = _ScanIndexThread(root, rescan, gen)
+        thread.indexed.connect(self._on_index_ready)
+        thread.finished.connect(lambda t=thread: _index_threads.discard(t))
+        _index_threads.add(thread)
+        self._index_thread = thread
+        thread.start()
+
+    def _on_index_ready(self, gen, dirs):
+        if gen != self._index_gen:
+            self._pump_index()
+            return
+        if not self.isVisible():
+            return
+        if dirs is None:
+            self._indexing = False
+            self._all_dirs = []
+            self._indexed = []
+            self._ok_btn.setEnabled(True)
+            self.lb_count.setText(f"Could not index {self.root}. Try Refresh.")
+            return
+        self._install_dirs(dirs)
+
+    def _install_dirs(self, dirs):
+        self._indexing = False
+        self._all_dirs = list(dirs)
         indexed = []
         for d in self._all_dirs:
             try:
-                label = str(d.relative_to(self.root))
+                label = str(Path(d).relative_to(self.root))
             except ValueError:
                 label = str(d)
-            indexed.append((label, d, parse_scan_timestamp(d)))
+            indexed.append((label, Path(d), parse_scan_timestamp(d)))
         self._indexed = indexed
+        self._ok_btn.setEnabled(True)
         self.apply_filter_sort()
 
     def _on_sort_changed(self, _=0):
@@ -1581,6 +1780,8 @@ class ScanPickerDialog(QDialog):
         self.apply_filter_sort()
 
     def apply_filter_sort(self):
+        if self._indexing:
+            return
         needle = self.ed_filter.text().strip().lower()
         rows = []
         for label, d, ts in self._indexed:
@@ -2439,6 +2640,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.fitter = Fitter()
         self.n_rois = 1
         self.skip = True
+        self._in_draw = False
+        self._draw_again = False
 
         self._rebuild_main_layout()
         self.cob_x.currentIndexChanged.connect(self.set_x)
@@ -2472,9 +2675,15 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         # Loaded scans = members of the current experiment. Selection is for Delete only.
         self.list_scans = QListWidget()
         self.list_scans.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list_scans.setToolTip("Scans in the current experiment. Select rows to delete.")
+        self.list_scans.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list_scans.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.list_scans.setToolTip(
+            "Scans in the current experiment. Drag to reorder, right-click to sort, select rows to delete."
+        )
         self.list_scans.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_scans.customContextMenuRequested.connect(self._loaded_scans_context_menu)
+        self.list_scans.model().rowsMoved.connect(self._on_loaded_scans_rows_moved)
+        self._syncing_scan_list = False
         self._shortcut_delete_scan = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.list_scans)
         self._shortcut_delete_scan.setContext(Qt.ShortcutContext.WidgetShortcut)
         self._shortcut_delete_scan.activated.connect(self._delete_loaded_scans)
@@ -3495,8 +3704,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         for axis_name in ("left", "bottom", "top", "right"):
             axis = plot_item.getAxis(axis_name)
             style_kw = {"tickFont": f}
-            if spec is None:
+            if spec is None or isinstance(axis, DateAxisItem):
+                # Date ticks put the weekday on one level and the clock on the next.
                 style_kw["maxTickLevel"] = 2
+                style_kw["maxTextLevel"] = 2
+                style_kw["autoExpandTextSpace"] = True
             else:
                 # Major ticks only, pointing into the axes box.
                 style_kw["maxTickLevel"] = 0
@@ -3636,7 +3848,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
     def _new_plot_widget(self, date_axis=False):
         if date_axis:
-            pw = PlotWidget(axisItems={"bottom": DateAxisItem(orientation="bottom")})
+            pw = PlotWidget(axisItems={"bottom": ScanDateAxisItem(orientation="bottom")})
         else:
             pw = PlotWidget()
         self._style_plot_item(pw.getPlotItem())
@@ -3646,9 +3858,20 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             pass
         return pw
 
+    def _point_hover_tip(self, plot_item, x, y, data):
+        bottom = plot_item.getAxis("bottom")
+        left = plot_item.getAxis("left")
+        return format_point_tip(
+            x, y, data,
+            xlabel=getattr(bottom, "labelText", "") or "",
+            ylabel=getattr(left, "labelText", "") or "",
+            x_is_time=isinstance(bottom, DateAxisItem),
+        )
+
     def _add_errorbar_scatter(
         self, plot_item, unique_x, means, heights, y_centers=None,
         style=None, name=None, view_style=None, show_errorbars=True, series_out=None,
+        tip_id=None, point_ids=None,
     ):
         """Curve + optional ErrorBarItem; register pair for legend sync."""
         unique_x = np.asarray(unique_x, dtype=float)
@@ -3685,7 +3908,23 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             plot_item.addItem(err_item)
         if name:
             plot_kw["name"] = name
+        if plot_kw.get("symbol"):
+            n = len(unique_x)
+            payloads = []
+            for i in range(n):
+                ident = None
+                if point_ids is not None and i < len(point_ids) and point_ids[i]:
+                    ident = str(point_ids[i])
+                h = float(heights[i]) if i < len(heights) else np.nan
+                yerr = h / 2.0 if np.isfinite(h) and h > 0 else None
+                payloads.append({"id": ident, "series": tip_id or None, "yerr": yerr})
+            plot_kw["data"] = payloads
         curve = plot_item.plot(unique_x, means, **plot_kw)
+        if plot_kw.get("symbol"):
+            curve.scatter.opts["hoverable"] = True
+            curve.scatter.opts["tip"] = (
+                lambda x, y, data, pi=plot_item: self._point_hover_tip(pi, x, y, data)
+            )
         link_curve_errorbar(curve, err_item)
         if series_out is not None:
             series_out.append((curve, err_item, name))
@@ -4594,14 +4833,18 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
     def rebuild_scan_list_widget(self, select_indices=None):
         self.skip = True
+        self._syncing_scan_list = True
         self.list_scans.clear()
         for scan in self.scans:
-            self.list_scans.addItem(scan.name)
+            item = QListWidgetItem(scan.name)
+            item.setData(Qt.ItemDataRole.UserRole, id(scan))
+            self.list_scans.addItem(item)
         if select_indices is None:
             select_indices = list(range(len(self.scans)))
         for i in select_indices:
             if 0 <= i < self.list_scans.count():
                 self.list_scans.item(i).setSelected(True)
+        self._syncing_scan_list = False
         self.skip = False
         self.sync_primary_aliases()
 
@@ -4719,7 +4962,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if primary is None or primary.plots is None:
             return False
 
+        # setRange clamps the thumb and would emit valueChanged → another draw.
+        self.scrollbar.blockSignals(True)
         self.scrollbar.setRange(0, max(primary.plots.n_plots() - 1, 0))
+        self.scrollbar.blockSignals(False)
 
         func = primary.metadata["function"]
         vst = self._curves_view_state()
@@ -4756,8 +5002,79 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             "penStyle": JOURNAL_PEN_STYLES[color_index % len(JOURNAL_PEN_STYLES)],
         }
 
+    def _scan_epoch(self, scan):
+        """Unix time of a scan from its date folder and scanHHMMSS, or None."""
+        if scan is None:
+            return None
+        raw = (getattr(scan, "name", None) or "").replace("\\", "/").strip("/")
+        for source in (getattr(scan, "path", None), raw):
+            if not source or not str(source).strip():
+                continue
+            ts = parse_scan_timestamp(source)
+            if ts is not None:
+                return ts.timestamp()
+        return None
+
+    def _epochs_for_scans(self, scans):
+        """One timestamp per scan, or None if any scan has no date."""
+        epochs = [self._scan_epoch(s) for s in scans]
+        if any(e is None for e in epochs):
+            return None
+        return epochs
+
+    def _epochs_for_scan_indices(self, indices):
+        """Map scan index → unix time, or None if any index has no date."""
+        out = {}
+        for v in indices:
+            try:
+                i = int(v)
+            except (TypeError, ValueError):
+                return None
+            if not (0 <= i < len(self.scans)):
+                return None
+            epoch = self._scan_epoch(self.scans[i])
+            if epoch is None:
+                return None
+            out[i] = epoch
+        return out
+
+    @staticmethod
+    def _coordinate_edges(centers):
+        """Bin edges so each center sits in its own cell, including irregular times."""
+        c = np.asarray(list(centers), dtype=float)
+        c = c[np.isfinite(c)]
+        if c.size == 0:
+            return c
+        if c.size == 1:
+            half = 1800.0 if c[0] > 1.0e8 else 0.5
+            return np.array([c[0] - half, c[0] + half])
+        edges = np.empty(c.size + 1, dtype=float)
+        edges[1:-1] = (c[:-1] + c[1:]) / 2.0
+        edges[0] = c[0] - (edges[1] - c[0])
+        edges[-1] = c[-1] + (c[-1] - edges[-2])
+        return edges
+
+    def _set_time_axis(self, plot_item, side, enabled, view_state=None):
+        """Use a date axis when scan is the coordinate, otherwise a numeric axis."""
+        if plot_item is None:
+            return
+        axis = plot_item.getAxis(side)
+        is_date = isinstance(axis, DateAxisItem)
+        if bool(enabled) == is_date:
+            return
+        new = ScanDateAxisItem(orientation=side) if enabled else AxisItem(orientation=side)
+        plot_item.setAxisItems({side: new})
+        self._style_plot_item(plot_item, view_state)
+        if enabled:
+            new.setStyle(autoExpandTextSpace=True)
+
     def _scan_short_name(self, scan):
-        return scan.name.replace("\\", "/").rstrip("/").split("/")[-1]
+        """Date plus scanHHMMSS. The clock time alone repeats across days."""
+        raw = (getattr(scan, "name", None) or "").replace("\\", "/").strip("/")
+        epoch = self._scan_epoch(scan)
+        if epoch is not None:
+            return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d/scan%H%M%S")
+        return raw or "scan"
 
     def _series_legend_name(self, scan, roi, n_scans, n_rois):
         short = self._scan_short_name(scan)
@@ -4773,24 +5090,38 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
     def draw_plot(self):
         if self.skip:
             return
-        if getattr(self, "curves_dock", None) is not None:
-            self._active_view_state = self.curves_dock.state
-            self._prepare_plot_widget(self.pw_plot, self.curves_dock.state)
-        enc = (self.curves_dock.state.encoding or {}) if getattr(self, "curves_dock", None) else {}
-        pt = enc.get("plot_type") or "xy"
-        if pt == "2d":
-            self._draw_2d_from_encoding(enc)
-        elif pt == "roi_grid":
-            self._draw_roi_grid_from_encoding(enc)
-        else:
-            kind, _ = self._curves_x_selection()
-            if kind == CURVES_X_ROI:
-                self._draw_plot_vs_roi()
-            elif kind == CURVES_X_TIME:
-                self._draw_plot_vs_time()
+        # processEvents during a large overlay must not start a second draw.
+        if self._in_draw:
+            self._draw_again = True
+            return
+        self._in_draw = True
+        self._draw_again = False
+        try:
+            if getattr(self, "curves_dock", None) is not None:
+                self._active_view_state = self.curves_dock.state
+                pi = self.pw_plot.getPlotItem()
+                self._set_time_axis(pi, "bottom", False, self.curves_dock.state)
+                self._set_time_axis(pi, "left", False, self.curves_dock.state)
+                self._prepare_plot_widget(self.pw_plot, self.curves_dock.state)
+            enc = (self.curves_dock.state.encoding or {}) if getattr(self, "curves_dock", None) else {}
+            pt = enc.get("plot_type") or "xy"
+            if pt == "2d":
+                self._draw_2d_from_encoding(enc)
+            elif pt == "roi_grid":
+                self._draw_roi_grid_from_encoding(enc)
             else:
-                self._draw_plot_vs_axis()
-        self.set_title()
+                kind, _ = self._curves_x_selection()
+                if kind == CURVES_X_ROI:
+                    self._draw_plot_vs_roi()
+                elif kind == CURVES_X_TIME:
+                    self._draw_plot_vs_time()
+                else:
+                    self._draw_plot_vs_axis()
+            self.set_title()
+        finally:
+            self._in_draw = False
+        if self._draw_again:
+            self.draw_plot()
 
     def _clear_plot_image_overlay(self, plot_widget):
         """Remove leftover 2D/ROI-grid ImageItem + ColorBar when back on XY curves."""
@@ -4804,6 +5135,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 pass
             plot_widget._scan_cbar = None
         plot_widget._scan_img = None
+        plot_widget._scan_imgs = None
 
     def _draw_plot_vs_axis(self):
         """Classic Curves: measurement vs Fit-along / scan axis."""
@@ -4845,6 +5177,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     series.append((scan, roi, slice_index, extra))
 
         show_legend = bool(vst.show_legend)
+        # Hundreds of named curves: one pyqtgraph item per series dominates load.
+        # Same-colored series are drawn together below, so a per-series legend
+        # would not match those items.
+        if len(series) >= 80:
+            show_legend = False
         if show_legend:
             self._add_legend(self.pw_plot, vst)
 
@@ -4855,18 +5192,103 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self._draw_axis_fits(series, n_scans)
 
     def _draw_axis_series(self, series, n_scans, n_rois, show_legend, vst):
+        if len(series) >= 80:
+            self._draw_axis_series_batched(series, vst)
+            return
         for color_i, (scan, roi, slice_index, extra) in enumerate(series):
             x, y = scan.plots.get_data(slice_index, roi)
             if not scan.metadata["key_sets"]:
                 x = np.arange(len(y))
-            name = self._series_legend_name(scan, roi, n_scans, n_rois) if show_legend else None
-            if name and extra:
-                name = f"{name}[{extra}]"
+            ident = self._series_legend_name(scan, roi, n_scans, n_rois)
+            if extra:
+                ident = f"{ident}[{extra}]"
+            name = ident if show_legend else None
             style = self._series_style(color_i)
             if "survival" in scan.metadata["function"].lower():
-                self.plot_survival(x, y, style=style, name=name, plot_widget=self.pw_plot, view_state=vst)
+                self.plot_survival(
+                    x, y, style=style, name=name, tip_id=ident,
+                    plot_widget=self.pw_plot, view_state=vst,
+                )
             else:
-                self.plot_errorbars(x, y, style=style, name=name, plot_widget=self.pw_plot, view_state=vst)
+                self.plot_errorbars(
+                    x, y, style=style, name=name, tip_id=ident,
+                    plot_widget=self.pw_plot, view_state=vst,
+                )
+
+    def _binned_curve(self, scan, x, y):
+        """Same bins as plot_survival / plot_errorbars, without creating items."""
+        if "survival" in (scan.metadata.get("function") or "").lower():
+            unique_x, means, err = self.get_survival_rate(x, y)
+            lower, upper = err[0], err[1]
+            heights = lower + upper
+            y_centers = means + (upper - lower) / 2
+        else:
+            unique_x, means, err = self.get_errorbars(x, y)
+            heights = np.asarray(err, dtype=float) * 2
+            y_centers = means
+        means_a = np.asarray(means, dtype=float)
+        if means_a.size == 0 or not np.any(np.isfinite(means_a)):
+            return None
+        return (
+            np.asarray(unique_x, dtype=float),
+            means_a,
+            np.asarray(heights, dtype=float),
+            np.asarray(y_centers, dtype=float),
+        )
+
+    def _draw_axis_series_batched(self, series, vst):
+        """Draw many same-styled curves as one item per color, not one per series."""
+        mode = (vst.style or {}).get("mode", "Scatter")
+        break_lines = mode in ("Line", "Line+marker")
+        n_scans = len({id(s) for s, _, _, _ in series})
+        n_rois = len({r for _, r, _, _ in series})
+        groups = {}
+        styles = {}
+        for color_i, (scan, roi, slice_index, extra) in enumerate(series):
+            x, y = scan.plots.get_data(slice_index, roi)
+            if not scan.metadata["key_sets"]:
+                x = np.arange(len(y))
+            binned = self._binned_curve(scan, x, y)
+            if binned is None:
+                continue
+            ident = self._series_legend_name(scan, roi, n_scans, n_rois)
+            if extra:
+                ident = f"{ident}[{extra}]"
+            style = self._series_style(color_i)
+            brush = style.get("symbolBrush") if isinstance(style, dict) else None
+            key = (
+                tuple(brush) if isinstance(brush, tuple) else brush,
+                style.get("symbol") if isinstance(style, dict) else None,
+                style.get("penStyle") if isinstance(style, dict) else None,
+            )
+            groups.setdefault(key, []).append((binned, ident))
+            styles.setdefault(key, style)
+        gap = np.array([np.nan])
+        for key, chunks in groups.items():
+            xs, ys, hs, cs, ids = [], [], [], [], []
+            for i, (binned, ident) in enumerate(chunks):
+                ux, means, heights, centers = binned
+                if break_lines and i:
+                    xs.append(gap)
+                    ys.append(gap)
+                    hs.append(gap)
+                    cs.append(gap)
+                    ids.append(None)
+                xs.append(ux)
+                ys.append(means)
+                hs.append(heights)
+                cs.append(centers)
+                ids.extend([ident] * len(ux))
+            self._add_errorbar_scatter(
+                self.pw_plot.getPlotItem(),
+                np.concatenate(xs), np.concatenate(ys), np.concatenate(hs),
+                y_centers=np.concatenate(cs),
+                style=styles[key], name=None,
+                view_style=vst.style,
+                show_errorbars=vst.show_errorbars,
+                series_out=vst.series_items,
+                point_ids=ids,
+            )
 
     def _draw_axis_fits(self, series, n_scans):
         summaries = []
@@ -4946,20 +5368,21 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         yerr.append(ye if np.isfinite(ye) else 0.0)
                     if not xs:
                         continue
-                    name = self._scan_short_name(scan) if show_legend else None
-                    if name and x_pick is not None and len(picks) > 1:
-                        name = f"{name}@{x_pick:g}"
-                    if name and len(slices) > 1 and key:
-                        name = f"{name}[{','.join(f'{v:g}' for v in key)}]"
+                    ident = self._scan_short_name(scan)
+                    if x_pick is not None and len(picks) > 1:
+                        ident = f"{ident}@{x_pick:g}"
+                    if len(slices) > 1 and key:
+                        ident = f"{ident}[{','.join(f'{v:g}' for v in key)}]"
                     self._add_errorbar_scatter(
                         self.pw_plot.getPlotItem(),
                         np.asarray(xs), np.asarray(ys), np.asarray(yerr) * 2,
                         y_centers=np.asarray(ys),
                         style=self._series_style(color_i),
-                        name=name,
+                        name=ident if show_legend else None,
                         view_style=vst.style,
                         show_errorbars=vst.show_errorbars,
                         series_out=vst.series_items,
+                        tip_id=ident,
                     )
                     color_i += 1
 
@@ -4977,24 +5400,15 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             return
         show_legend = bool(vst.show_legend)
 
-        raw_times = []
-        parsed_any = False
-        for s_i in scan_idxs:
-            ts = parse_scan_timestamp(self.scans[s_i].path)
-            if ts:
-                raw_times.append(ts.timestamp())
-                parsed_any = True
-            else:
-                raw_times.append(float(s_i))
-        if parsed_any:
-            t0 = min(raw_times)
-            times = [t - t0 for t in raw_times]
-            self._set_plot_label(
-                self.pw_plot.getPlotItem(), "bottom", "Δt from first scan (s)", vst
-            )
+        plotted = [self.scans[i] for i in scan_idxs]
+        epochs = self._epochs_for_scans(plotted)
+        if epochs is not None:
+            times = list(epochs)
+            self._set_time_axis(self.pw_plot.getPlotItem(), "bottom", True, vst)
+            self._set_plot_label(self.pw_plot.getPlotItem(), "bottom", "scan time", vst)
         else:
             times = [float(i) for i in range(len(scan_idxs))]
-            self._set_plot_label(self.pw_plot.getPlotItem(), "bottom", "scan index", vst)
+            self._set_plot_label(self.pw_plot.getPlotItem(), "bottom", "scan", vst)
         if show_legend:
             self._add_legend(self.pw_plot, vst)
 
@@ -5010,7 +5424,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         color_i = 0
         for x_pick in picks:
             for roi in roi_idxs:
-                xs, ys, yerr = [], [], []
+                xs, ys, yerr, ids = [], [], [], []
                 for j, s_i in enumerate(scan_idxs):
                     scan = self.scans[s_i]
                     if scan.plots is None or not scan.plots.plots:
@@ -5025,35 +5439,36 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     xs.append(times[j])
                     ys.append(yv)
                     yerr.append(ye if np.isfinite(ye) else 0.0)
+                    ids.append(self._scan_short_name(scan))
                 if not xs:
                     continue
                 order = np.argsort(xs)
                 xs = np.asarray(xs, dtype=float)[order]
                 ys = np.asarray(ys, dtype=float)[order]
                 yerr = np.asarray(yerr, dtype=float)[order]
-                if show_legend:
-                    if len(picks) > 1 and x_pick is not None:
-                        name = (
-                            f"ROI {roi}@{x_pick:g}"
-                            if len(roi_idxs) > 1
-                            else f"{x_pick:g}"
-                        )
-                    else:
-                        name = f"ROI {roi}"
+                ids = [ids[int(i)] for i in order]
+                if len(picks) > 1 and x_pick is not None:
+                    series_tip = (
+                        f"ROI {roi}@{x_pick:g}"
+                        if len(roi_idxs) > 1
+                        else f"{x_pick:g}"
+                    )
                 else:
-                    name = None
+                    series_tip = f"ROI {roi}"
                 self._add_errorbar_scatter(
                     self.pw_plot.getPlotItem(),
                     xs, ys, yerr * 2, y_centers=ys,
                     style=self._series_style(color_i),
-                    name=name,
+                    name=series_tip if show_legend else None,
                     view_style=vst.style,
                     show_errorbars=vst.show_errorbars,
                     series_out=vst.series_items,
+                    tip_id=series_tip,
+                    point_ids=ids,
                 )
                 color_i += 1
 
-    def plot_survival(self, x, y, style=None, name=None, plot_widget=None, view_state=None):
+    def plot_survival(self, x, y, style=None, name=None, plot_widget=None, view_state=None, tip_id=None):
         pw = plot_widget or self.pw_plot
         vst = view_state or self._curves_view_state()
         unique_x, means, err = self.get_survival_rate(x, y)
@@ -5072,9 +5487,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             view_style=vst.style,
             show_errorbars=vst.show_errorbars,
             series_out=vst.series_items,
+            tip_id=name if tip_id is None else tip_id,
         )
 
-    def plot_errorbars(self, x, y, style=None, name=None, plot_widget=None, view_state=None):
+    def plot_errorbars(self, x, y, style=None, name=None, plot_widget=None, view_state=None, tip_id=None):
         pw = plot_widget or self.pw_plot
         vst = view_state or self._curves_view_state()
         unique_x, means, err = self.get_errorbars(x, y)
@@ -5088,6 +5504,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             view_style=vst.style,
             show_errorbars=vst.show_errorbars,
             series_out=vst.series_items,
+            tip_id=name if tip_id is None else tip_id,
         )
     
     def get_errorbars(self, x, y):
@@ -5217,7 +5634,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             title += f"({n_scans} scans × {n_rois} ROIs)"
         self.pw_plot.setTitle(title.rstrip(", "), **font)
 
-    def create_new_plot(self, metadata=None):
+    def create_new_plot(self, metadata=None, x_index=0):
         # metadata arg kept for compatibility; multi-scan uses self.scans
         if metadata is not None and self.primary_scan() is not None:
             self.primary_scan().metadata = metadata
@@ -5231,11 +5648,15 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.cob_x.addItems(["repetition"])
         self.refresh_roi_list()
         self.skip = False
-        # Reset / populate universal encoding
-        if self.metadata["key_sets"]:
-            self.curves_dock.state.encoding = default_encoding(dim_id_axis(0))
-        else:
-            self.curves_dock.state.encoding = default_encoding(dim_id_axis(0))
+        # Reset / populate universal encoding. x_index is the saved experiment axis.
+        n_keys = len(self.metadata.get("key_sets") or [])
+        try:
+            x_index = int(x_index)
+        except (TypeError, ValueError):
+            x_index = 0
+        if n_keys and not (0 <= x_index < n_keys):
+            x_index = 0
+        self.curves_dock.state.encoding = default_encoding(dim_id_axis(x_index if n_keys else 0))
         self._populate_curves_encoding()
         enc = self.curves_dock.state.encoding
         drew = self._sync_legacy_from_encoding(enc)
@@ -5571,6 +5992,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
     def _show_image_on_plot_widget(
         self, plot_widget, data, x0, y0, w, h, xlabel="", ylabel="", dock=None,
+        x_edges=None, y_edges=None,
     ):
         """Draw a color image (+ colorbar) into an existing PlotWidget."""
         plot_widget.clear()
@@ -5591,14 +6013,45 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         img_data = np.asarray(data, dtype=float)
         cmap = pg_colormap.get("viridis")
         lut = cmap.getLookupTable(nPts=256)
-        img = ImageItem(img_data)
-        img.setOpts(axisOrder="row-major")
-        img.setLookupTable(lut)
-        img.setRect(x0, y0, w, h)
-        pi.addItem(img)
         vmin, vmax = self._colorbar_levels_from_dock(dock, img_data)
-        img.setLevels([vmin, vmax])
+        images = []
+        y_edges = None if y_edges is None else np.asarray(y_edges, dtype=float)
+        x_edges = None if x_edges is None else np.asarray(x_edges, dtype=float)
+        if y_edges is not None and y_edges.size == img_data.shape[0] + 1:
+            for i in range(img_data.shape[0]):
+                height = float(y_edges[i + 1] - y_edges[i])
+                if height == 0:
+                    continue
+                img = ImageItem(img_data[i:i + 1])
+                img.setOpts(axisOrder="row-major")
+                img.setLookupTable(lut)
+                img.setRect(x0, float(y_edges[i]), w, height)
+                img.setLevels([vmin, vmax])
+                pi.addItem(img)
+                images.append(img)
+        elif x_edges is not None and img_data.ndim == 2 and x_edges.size == img_data.shape[1] + 1:
+            for j in range(img_data.shape[1]):
+                width = float(x_edges[j + 1] - x_edges[j])
+                if width == 0:
+                    continue
+                img = ImageItem(img_data[:, j:j + 1])
+                img.setOpts(axisOrder="row-major")
+                img.setLookupTable(lut)
+                img.setRect(float(x_edges[j]), y0, width, h)
+                img.setLevels([vmin, vmax])
+                pi.addItem(img)
+                images.append(img)
+        else:
+            img = ImageItem(img_data)
+            img.setOpts(axisOrder="row-major")
+            img.setLookupTable(lut)
+            img.setRect(x0, y0, w, h)
+            img.setLevels([vmin, vmax])
+            pi.addItem(img)
+            images.append(img)
+        img = images[0] if images else None
         plot_widget._scan_img = img
+        plot_widget._scan_imgs = images
         try:
             cbar = ColorBarItem(
                 values=(vmin, vmax),
@@ -5609,12 +6062,15 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             cbar.setImageItem(img, insert_in=pi)
             plot_widget._scan_cbar = cbar
             if dock is not None:
-                def _on_levels(*_args, d=dock, im=img, panel_host=plot_widget):
+                def _on_levels(*_args, d=dock, im=img, panel_host=plot_widget, imgs=images):
                     try:
                         lv = im.levels
                         if lv is None or len(lv) < 2:
                             return
                         lo, hi = float(lv[0]), float(lv[1])
+                        for other in imgs:
+                            if other is not im:
+                                other.setLevels([lo, hi])
                         d.state.colorbar_auto = False
                         d.state.colorbar_vmin = lo
                         d.state.colorbar_vmax = hi
@@ -5765,11 +6221,26 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             data[i, np.searchsorted(global_x, unique_x)] = means
         key_sets = scans[0].metadata.get("key_sets") or []
         xlabel = key_sets[axis_i][-1] if key_sets and axis_i < len(key_sets) else "axis"
-        ylabel = "scan"
-        y_vals = np.arange(len(scans), dtype=float)
+        epochs = self._epochs_for_scans(scans)
+        if epochs is not None:
+            scan_vals = np.asarray(epochs, dtype=float)
+            scan_label = "scan time"
+            edges = self._coordinate_edges(scan_vals)
+        else:
+            scan_vals = np.arange(len(scans), dtype=float)
+            scan_label = "scan"
+            edges = None
         if scan_as_y:
-            return self._pack_2d_coords(data, global_x, y_vals, xlabel, ylabel)
-        return self._pack_2d_coords(data.T, y_vals, global_x, ylabel, xlabel)
+            out = self._pack_2d_coords(data, global_x, scan_vals, xlabel, scan_label)
+            if out is not None and edges is not None:
+                out["y_edges"] = edges
+                out["time_axis"] = "left"
+            return out
+        out = self._pack_2d_coords(data.T, scan_vals, global_x, scan_label, xlabel)
+        if out is not None and edges is not None:
+            out["x_edges"] = edges
+            out["time_axis"] = "bottom"
+        return out
 
     def _assemble_2d_roi_scan(self, scans, *, scan_as_y=True, enc=None):
         """Heatmap: ROI × loaded-scan index (one scalar Y per curve)."""
@@ -5796,10 +6267,26 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not np.any(np.isfinite(data)):
             return None
         roi_vals = np.arange(n_rois, dtype=float)
-        scan_vals = np.arange(len(scans), dtype=float)
+        epochs = self._epochs_for_scans(scans)
+        if epochs is not None:
+            scan_vals = np.asarray(epochs, dtype=float)
+            scan_label = "scan time"
+            edges = self._coordinate_edges(scan_vals)
+        else:
+            scan_vals = np.arange(len(scans), dtype=float)
+            scan_label = "scan"
+            edges = None
         if scan_as_y:
-            return self._pack_2d_coords(data.T, roi_vals, scan_vals, "ROI", "scan")
-        return self._pack_2d_coords(data, scan_vals, roi_vals, "scan", "ROI")
+            out = self._pack_2d_coords(data.T, roi_vals, scan_vals, "ROI", scan_label)
+            if out is not None and edges is not None:
+                out["y_edges"] = edges
+                out["time_axis"] = "left"
+            return out
+        out = self._pack_2d_coords(data, scan_vals, roi_vals, scan_label, "ROI")
+        if out is not None and edges is not None:
+            out["x_edges"] = edges
+            out["time_axis"] = "bottom"
+        return out
 
     def _curve_x_pick_from_encoding(self, enc, fit_along):
         """If Dimensions fix the fit-along axis to One value, use it as curve x_pick."""
@@ -5931,7 +6418,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             assembled["x0"], assembled["y0"], assembled["w"], assembled["h"],
             xlabel=assembled["xlabel"], ylabel=assembled["ylabel"],
             dock=getattr(self, "curves_dock", None),
+            x_edges=assembled.get("x_edges"),
+            y_edges=assembled.get("y_edges"),
         )
+        time_side = assembled.get("time_axis")
+        if time_side:
+            vst = self._curves_view_state()
+            self._set_time_axis(self.pw_plot.getPlotItem(), time_side, True, vst)
+            self._set_plot_label(
+                self.pw_plot.getPlotItem(),
+                "bottom" if time_side == "bottom" else "left",
+                assembled["xlabel"] if time_side == "bottom" else assembled["ylabel"],
+                vst,
+            )
         x_dim = enc.get("x_dim") or ""
         y_dim = enc.get("y_dim") or ""
         self.pw_plot.setTitle(
@@ -6108,6 +6607,20 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not buckets:
             self.statusBar().showMessage("2D: no derived points for current X/Y", 4000)
             return
+        x_is_time = parse_dim_id(x_dim)[0] == "scan"
+        y_is_time = parse_dim_id(y_dim)[0] == "scan"
+        if x_is_time:
+            emap = self._epochs_for_scan_indices({xy[0] for xy in buckets})
+            if emap is None:
+                x_is_time = False
+            else:
+                buckets = {(emap[int(xv)], yv): zs for (xv, yv), zs in buckets.items()}
+        if y_is_time:
+            emap = self._epochs_for_scan_indices({xy[1] for xy in buckets})
+            if emap is None:
+                y_is_time = False
+            else:
+                buckets = {(xv, emap[int(yv)]): zs for (xv, yv), zs in buckets.items()}
         x_vals = sorted({xy[0] for xy in buckets})
         y_vals = sorted({xy[1] for xy in buckets})
         data = np.full((len(y_vals), len(x_vals)), np.nan, dtype=float)
@@ -6121,14 +6634,29 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         # Use span covering last center + 0.5
         w = (float(x_vals[-1]) + 0.5) - x0
         h = (float(y_vals[-1]) + 0.5) - y0
+        x_edges = self._coordinate_edges(x_vals) if x_is_time else None
+        y_edges = self._coordinate_edges(y_vals) if y_is_time else None
+        if x_edges is not None and x_edges.size:
+            x0 = float(x_edges[0])
+            w = float(x_edges[-1] - x_edges[0])
+        if y_edges is not None and y_edges.size:
+            y0 = float(y_edges[0])
+            h = float(y_edges[-1] - y_edges[0])
         panel = getattr(dock, "encoding_panel", None)
         cat = {d["id"]: d for d in (getattr(panel, "_dim_catalog", None) or [])}
-        xlabel = (cat.get(x_dim) or {}).get("label") or x_dim
-        ylabel = (cat.get(y_dim) or {}).get("label") or y_dim
+        xlabel = "scan time" if x_is_time else ((cat.get(x_dim) or {}).get("label") or x_dim)
+        ylabel = "scan time" if y_is_time else ((cat.get(y_dim) or {}).get("label") or y_dim)
         pw = dock.plot_widget
         self._show_image_on_plot_widget(
             pw, data, x0, y0, w, h, xlabel=xlabel, ylabel=ylabel, dock=dock,
+            x_edges=x_edges, y_edges=y_edges,
         )
+        if x_is_time:
+            self._set_time_axis(pw.getPlotItem(), "bottom", True, dock.state)
+            self._set_plot_label(pw.getPlotItem(), "bottom", xlabel, dock.state)
+        if y_is_time:
+            self._set_time_axis(pw.getPlotItem(), "left", True, dock.state)
+            self._set_plot_label(pw.getPlotItem(), "left", ylabel, dock.state)
         pw.setTitle(f"2D: {xlabel} × {ylabel}", **font)
 
     def two_d_plot(self, recipe=None, dock=None):
@@ -6388,7 +6916,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 ctrls.cob_fit.blockSignals(True)
                 ctrls.cob_fit.setCurrentIndex(i)
                 ctrls.cob_fit.blockSignals(False)
-        points = self._compute_derive_points(src_enc, fitfunc, param_name, new_x)
+        src_scans = self._dock_derived_scan_list(dock)
+        points = self._compute_derive_points(
+            src_enc, fitfunc, param_name, new_x, scans=src_scans or None
+        )
         if not points:
             QMessageBox.warning(self, "Derive", "No fit points produced.")
             return
@@ -6430,6 +6961,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             "source_encoding": src_enc,
         }
         self._record_tab_recipe(recipe, dock=out)
+        if src_scans:
+            out._fit_source_scans = src_scans
         self._redraw_universal_dock(out)
         self.statusBar().showMessage(f"Derived {param_name} ({len(points)} points)", 4000)
 
@@ -6440,7 +6973,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         plots (average over ROI / scan / remaining axes).
         """
         dock = dock or self.curves_dock
-        enc = dock.state.encoding or default_encoding()
+        enc = self._encoding_for_average(dock)
         x_dim = enc.get("x_dim")
         src_scans = self._dock_derived_scan_list(dock)
         src_points = list(dock.state.derived_points or [])
@@ -6450,7 +6983,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         mode = "scans"
         scans = []
         if src_scans:
-            scans = list(src_scans)
+            idxs = self._encoding_local_scan_indices(enc, len(src_scans))
+            scans = [src_scans[i] for i in idxs]
         elif src_points:
             mode = "points"
         else:
@@ -6483,7 +7017,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         if mode == "points":
             try:
-                reduced_pts = self._average_derived_points_over_dims(src_points, dim_ids)
+                scoped = self._points_in_average_selection(src_points, enc, dim_ids)
+                reduced_pts = self._average_derived_points_over_dims(scoped, dim_ids)
             except Exception as exc:
                 logging.error("Average (fit points) failed: %s", exc)
                 QMessageBox.warning(self, "Average", str(exc))
@@ -6501,8 +7036,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     d["values"] = vals or [0]
                     d["value_labels"] = [f"ROI {i}" for i in d["values"]]
                 elif kind == "scan":
+                    prev = {
+                        v: lab
+                        for v, lab in zip(d.get("values") or [], d.get("value_labels") or [])
+                    }
                     vals = sorted({int(p.get("scan_i", 0)) for p in reduced_pts})
                     d["values"] = vals or [0]
+                    d["value_labels"] = [
+                        prev.get(i) or (
+                            self._scan_short_name(self.scans[i])
+                            if 0 <= i < len(self.scans) else f"scan {i}"
+                        )
+                        for i in d["values"]
+                    ]
                 elif kind == "axis":
                     vals = sorted({
                         float(v) for v in (
@@ -6554,7 +7100,14 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             return
 
         try:
-            reduced_list = self._average_scans_over_dims(scans, dim_ids)
+            keep = {}
+            for did in dim_ids:
+                if parse_dim_id(did)[0] == "scan":
+                    continue
+                vals = self._average_keep_values(enc, did)
+                if vals is not None:
+                    keep[did] = vals
+            reduced_list = self._average_scans_over_dims(scans, dim_ids, keep=keep)
         except Exception as exc:
             logging.error("Average failed: %s", exc)
             QMessageBox.warning(self, "Average", str(exc))
@@ -6716,20 +7269,97 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 out.append(sum(float(c) for c in cells) / n)
         return out
 
-    def _average_scan_rois(self, scan):
+    def _encoding_for_average(self, dock):
+        """Encoding the user is looking at, including One / Multi selections."""
+        panel = getattr(dock, "encoding_panel", None)
+        if panel is not None and getattr(panel, "_dim_catalog", None):
+            enc = panel.read_encoding()
+            prev = getattr(dock.state, "encoding", None) or {}
+            ych = prev.get("y_channel")
+            if isinstance(ych, str) and ych.startswith("fit:"):
+                if enc.get("y_channel") in (None, "", Y_CHANNEL_MEASUREMENT):
+                    enc["y_channel"] = ych
+            return enc
+        return dock.state.encoding or default_encoding()
+
+    def _average_keep_values(self, enc, dim_id):
+        """Values to include when averaging ``dim_id``. None means every value.
+
+        One and Multi use the Encoding selection. All and Mean use every value.
+        A dimension that is the plot X is not in the sidebar, so it stays None.
+        """
+        st = (enc.get("dims") or {}).get(dim_id)
+        if not isinstance(st, dict) or not st:
+            return None
+        mode = st.get("mode") or DIM_MODE_ALL
+        if mode in (DIM_MODE_ALL, DIM_MODE_MEAN):
+            return None
+        vals = [v for v in (st.get("values") or []) if v is not None]
+        return vals or None
+
+    def _points_in_average_selection(self, points, enc, dim_ids):
+        """Drop fit-param points outside the selection of each averaged dim."""
+        out = list(points or [])
+        for did in dim_ids:
+            keep = self._average_keep_values(enc, did)
+            if keep is None:
+                continue
+            kind, _ai = parse_dim_id(did)
+            if kind == "roi":
+                want = {int(v) for v in keep}
+                out = [p for p in out if int(p.get("roi", -1)) in want]
+            elif kind == "scan":
+                want = {int(v) for v in keep}
+                out = [p for p in out if int(p.get("scan_i", -1)) in want]
+            elif kind == "axis":
+                want = set()
+                for v in keep:
+                    try:
+                        want.add(round(float(v), 9))
+                    except (TypeError, ValueError):
+                        want.add(v)
+                kept = []
+                for p in out:
+                    v = self._derived_point_dim_value(p, did)
+                    try:
+                        v = round(float(v), 9)
+                    except (TypeError, ValueError):
+                        pass
+                    if v in want:
+                        kept.append(p)
+                out = kept
+        if dim_ids and not out:
+            raise ValueError("No points matched the selected dimension values")
+        return out
+
+    def _average_scan_rois(self, scan, roi_indices=None):
         if not scan.data:
             raise ValueError("Scan has no data")
         n_roi = len(scan.data[0])
-        if n_roi < 2:
+        if roi_indices is None:
+            idxs = list(range(n_roi))
+        else:
+            idxs = []
+            for v in roi_indices:
+                try:
+                    i = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= i < n_roi and i not in idxs:
+                    idxs.append(i)
+            if not idxs:
+                raise ValueError(f"No selected ROIs in {scan.name}")
+        if len(idxs) < 2 and roi_indices is None and n_roi < 2:
             return copy.deepcopy(scan)
         data = []
         for point in scan.data:
-            if isinstance(point[0], (list, tuple, np.ndarray)):
-                a = sum(float(x[0]) for x in point) / n_roi
-                b = sum(float(x[1]) for x in point) / n_roi
+            cells = [point[i] for i in idxs]
+            if isinstance(cells[0], (list, tuple, np.ndarray)):
+                a = sum(float(x[0]) for x in cells) / len(cells)
+                b = sum(float(x[1]) for x in cells) / len(cells)
                 data.append([[a, b]])
             else:
-                data.append([sum(float(x) for x in point) / n_roi])
+                data.append([sum(float(x) for x in cells) / len(cells)])
         meta = copy.deepcopy(scan.metadata)
         fn = meta.get("function") or ""
         meta["function"] = f"AvgROI {fn}".strip()
@@ -6806,19 +7436,39 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             data=data,
         )
 
-    def _average_scan_axis(self, scan, axis_i):
+    def _average_scan_axis(self, scan, axis_i, keep_values=None):
         key_sets = list(scan.metadata.get("key_sets") or [])
         points = list(scan.metadata.get("points") or [])
         if axis_i < 0 or axis_i >= len(key_sets):
             raise ValueError(f"Invalid axis index {axis_i}")
         if len(points) != len(scan.data):
             raise ValueError("points/data length mismatch")
+        keep = None
+        if keep_values is not None:
+            keep = set()
+            for v in keep_values:
+                try:
+                    keep.add(round(float(v), 9))
+                except (TypeError, ValueError):
+                    keep.add(v)
         groups = {}
         for pi, pt in enumerate(points):
             if not isinstance(pt, (list, tuple)) or len(pt) <= axis_i:
                 raise ValueError("Malformed scan point for axis average")
+            if keep is not None:
+                av = pt[axis_i]
+                try:
+                    av = round(float(av), 9)
+                except (TypeError, ValueError):
+                    pass
+                if av not in keep:
+                    continue
             key = tuple(v for j, v in enumerate(pt) if j != axis_i)
             groups.setdefault(key, []).append(pi)
+        if keep is not None and not groups:
+            raise ValueError(
+                f"No points matched the selected values of {key_sets[axis_i][-1]}"
+            )
         new_points = []
         new_data = []
         for key, idxs in groups.items():
@@ -6840,7 +7490,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             data=new_data,
         )
 
-    def _average_scans_over_dims(self, scans, dim_ids):
+    def _average_scans_over_dims(self, scans, dim_ids, keep=None):
         """Apply average collapses in order; return list of ScanDatasets.
 
         Collapsing ROI/axis runs per scan (scan dim kept). Including ``scan``
@@ -6850,6 +7500,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         several axes are averaged in one step.
         """
         current = list(scans)
+        keep = keep or {}
         axes = []
         other = []
         for did in dim_ids:
@@ -6861,11 +7512,13 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         for did in axes + other:
             kind, ai = parse_dim_id(did)
             if kind == "roi":
-                current = [self._average_scan_rois(s) for s in current]
+                current = [self._average_scan_rois(s, keep.get("roi")) for s in current]
             elif kind == "scan":
                 current = [self._average_across_scans(current)]
             elif kind == "axis":
-                current = [self._average_scan_axis(s, ai) for s in current]
+                current = [
+                    self._average_scan_axis(s, ai, keep.get(did)) for s in current
+                ]
             else:
                 raise ValueError(f"Unknown dimension {did}")
         return current
@@ -7042,10 +7695,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             bt_clear_scans=ana.bt_clear_data,
         )
 
-    def _compute_derive_points(self, src_enc, fitfunc, param_name, new_x_dim):
+    def _compute_derive_points(self, src_enc, fitfunc, param_name, new_x_dim, scans=None):
         """Fit each series along src X; return points [{x,y,yerr,label}, ...] for new_x_dim.
 
         The outer X dimension is always expanded (All values). Other dims follow src_enc.
+        ``scans`` is the cube to fit. Derived Average docks pass their own scans;
+        Curves omits it and uses the loaded scans.
         """
         # Outer X must not be pinned to One in the source encoding, or Derive
         # collapses to a single point.
@@ -7053,15 +7708,32 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         dims = enc.setdefault("dims", {})
         if new_x_dim and new_x_dim != enc.get("x_dim"):
             dims[new_x_dim] = {"mode": DIM_MODE_ALL, "values": []}
-        self._sync_legacy_from_encoding(enc)
-        scan_idxs = self._encoding_scan_indices(enc) if enc.get("x_dim") != "scan" else list(range(len(self.scans)))
+        cube = list(scans) if scans else list(self.scans)
+        using_derived = bool(scans)
+        if not using_derived:
+            self._sync_legacy_from_encoding(enc)
         if enc.get("x_dim") == "scan" or new_x_dim == "scan":
-            scan_idxs = list(range(len(self.scans)))
-        if new_x_dim == "roi" or enc.get("x_dim") == "roi":
-            cat = {d["id"]: d for d in self._cube_dim_catalog()}
-            roi_idxs = list((cat.get("roi") or {}).get("values") or [0])
+            scan_idxs = list(range(len(cube)))
+        elif using_derived:
+            scan_idxs = self._encoding_local_scan_indices(enc, len(cube))
         else:
-            roi_idxs = self._encoding_roi_indices(enc)
+            scan_idxs = self._encoding_scan_indices(enc)
+        x_kind, x_axis = parse_dim_id(enc.get("x_dim") or "axis:0")
+        fit_along = x_axis if x_kind == "axis" else 0
+        n_rois = None
+        if using_derived and cube and cube[0].data:
+            try:
+                n_rois = len(cube[0].data[0])
+            except Exception:
+                n_rois = 1
+        if new_x_dim == "roi" or enc.get("x_dim") == "roi":
+            if n_rois is not None:
+                roi_idxs = list(range(max(1, int(n_rois))))
+            else:
+                cat = {d["id"]: d for d in self._cube_dim_catalog()}
+                roi_idxs = list((cat.get("roi") or {}).get("values") or [0])
+        else:
+            roi_idxs = self._encoding_roi_indices(enc, n_rois=n_rois)
 
         fit_params = self.fitter.func_dict[fitfunc]["params"]
         if param_name not in fit_params:
@@ -7069,14 +7741,23 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         p_i = fit_params.index(param_name)
         nx_kind, nx_axis = parse_dim_id(new_x_dim)
         points = []
+        scan_time_ok = nx_kind == "scan" and self._epochs_for_scans(
+            [cube[i] for i in scan_idxs if 0 <= i < len(cube)]
+        ) is not None
 
         for s_i in scan_idxs:
-            scan = self.scans[s_i]
+            if not (0 <= s_i < len(cube)):
+                continue
+            scan = cube[s_i]
+            if using_derived:
+                self._ensure_scan_plots(scan, fit_along)
             if scan.plots is None:
                 continue
             # Expand all slices when outer X is a non-fit-along axis
             if nx_kind == "axis" and nx_axis != scan.plots.x_index:
                 slices = list(range(scan.plots.n_plots()))
+            elif using_derived:
+                slices = self._encoding_matching_slices(scan, enc)
             else:
                 slices = self._matching_slice_indices(scan)
             keys = list(scan.plots.plots.keys())
@@ -7097,8 +7778,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     if nx_kind == "roi":
                         xv = float(roi)
                     elif nx_kind == "scan":
-                        ts = parse_scan_timestamp(scan.path)
-                        xv = ts.timestamp() if ts else float(s_i)
+                        xv = self._scan_epoch(scan) if scan_time_ok else float(s_i)
                     else:
                         # axis value from slice key or mean of curve x
                         fit_along = scan.plots.x_index
@@ -7137,10 +7817,6 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         "roi": roi,
                         "axis_vals": axis_vals,
                     })
-        if nx_kind == "scan" and points:
-            t0 = min(p["x"] for p in points)
-            for p in points:
-                p["x"] = p["x"] - t0
         return points
 
     def _derived_point_dim_value(self, p, dim_id):
@@ -7364,7 +8040,9 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             ):
                 continue
             src_dims[did] = copy.deepcopy(st)
-        points = self._compute_derive_points(src, fitfunc, param, new_x)
+        points = self._compute_derive_points(
+            src, fitfunc, param, new_x, scans=getattr(dock, "_fit_source_scans", None)
+        )
         dock.state.derived_points = points
         rec["x_dim"] = new_x
         dock.state.recipe = rec
@@ -7421,6 +8099,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         pw = dock.plot_widget
         if not isinstance(pw, PlotWidget):
             return
+        self._set_time_axis(pw.getPlotItem(), "bottom", False, dock.state)
+        self._set_time_axis(pw.getPlotItem(), "left", False, dock.state)
         enc = dock.state.encoding or {}
         pt = enc.get("plot_type") or "xy"
         ych = enc.get("y_channel") or Y_CHANNEL_MEASUREMENT
@@ -7487,11 +8167,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 key = self._derived_fit_series_key(p, x_dim, axis_ids)
                 bucket = groups.get(key)
                 if bucket is None:
-                    bucket = [[], [], []]
+                    bucket = [[], [], [], []]
                     groups[key] = bucket
                 bucket[0].append(xv)
                 bucket[1].append(float(p["y"]))
                 bucket[2].append(float(p.get("yerr", 0.0) or 0.0))
+                bucket[3].append(str(p.get("label") or ""))
             order_keys = sorted(groups, key=lambda k: tuple(
                 (0, v) if isinstance(v, (int, float)) else (1, str(v))
                 for _kind, v in k
@@ -7511,26 +8192,35 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             if order_keys:
                 with self._batch_plot_items(pw):
                     for color_i, key in enumerate(order_keys):
-                        gxs, gys, gyerr = groups[key]
+                        gxs, gys, gyerr, glab = groups[key]
                         gxs = np.asarray(gxs, dtype=float)
                         gys = np.asarray(gys, dtype=float)
                         gyerr = np.asarray(gyerr, dtype=float)
                         ord_i = np.argsort(gxs, kind="mergesort")
                         gxs, gys, gyerr = gxs[ord_i], gys[ord_i], gyerr[ord_i]
-                        name = None
-                        if dock.state.show_legend:
-                            name = self._derived_fit_legend_name(key, varying, dock)
+                        glab = [glab[int(i)] for i in ord_i]
+                        tip_name = self._derived_fit_legend_name(key, varying, dock)
                         style = self._series_style(color_i, dock.state)
                         self._add_errorbar_scatter(
                             pw.getPlotItem(),
                             gxs, gys, gyerr * 2,
                             y_centers=gys,
                             style=style,
-                            name=name,
+                            name=tip_name if dock.state.show_legend else None,
                             view_style=dock.state.style,
                             show_errorbars=dock.state.show_errorbars,
                             series_out=dock.state.series_items,
+                            tip_id=tip_name,
+                            point_ids=glab,
                         )
+            if x_dim == "scan":
+                xs = [
+                    float(p["x"]) for p in pts
+                    if p.get("x") is not None and np.isfinite(float(p["x"]))
+                ]
+                if xs and min(xs) > 1.0e8:
+                    self._set_time_axis(pw.getPlotItem(), "bottom", True, dock.state)
+                    self._set_plot_label(pw.getPlotItem(), "bottom", "scan time", dock.state)
             return
 
         if dock.state.derived_scan is not None:
@@ -7653,6 +8343,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             ys_arr[finite],
             np.nan_to_num(yerr_arr[finite], nan=0.0) * 2,
             y_centers=ys_arr[finite],
+            tip_id=self._scan_short_name(scan),
         )
         title = f"Fit param: {param_name} ({mode_tag})"
         recipe = {
@@ -7803,9 +8494,22 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
     def _loaded_scans_context_menu(self, pos):
         menu = QMenu(self)
         act_del = menu.addAction("Delete")
+        menu.addSeparator()
+        act_name = menu.addAction("Sort by name")
+        act_new = menu.addAction("Sort newest first")
+        act_old = menu.addAction("Sort oldest first")
+        has_scans = bool(self.scans)
+        for act in (act_name, act_new, act_old):
+            act.setEnabled(has_scans)
         chosen = menu.exec(self.list_scans.mapToGlobal(pos))
         if chosen is act_del:
             self._delete_loaded_scans()
+        elif chosen is act_name:
+            self._sort_loaded_scans("name")
+        elif chosen is act_new:
+            self._sort_loaded_scans("newest")
+        elif chosen is act_old:
+            self._sort_loaded_scans("oldest")
 
     def _remap_scan_index(self, index, removed):
         if index in removed:
@@ -7827,6 +8531,100 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             if mapped is not None:
                 new.append(mapped)
         st["values"] = new
+
+    def _permute_encoding(self, enc, old_to_new):
+        if not isinstance(enc, dict):
+            return
+        st = (enc.get("dims") or {}).get("scan")
+        if not isinstance(st, dict):
+            return
+        new = []
+        for value in st.get("values") or []:
+            try:
+                mapped = old_to_new.get(int(value))
+            except (TypeError, ValueError):
+                continue
+            if mapped is not None:
+                new.append(mapped)
+        st["values"] = new
+
+    def _apply_scan_order(self, new_order, *, rebuild=False):
+        """Reorder scans. new_order[new_index] is the previous index."""
+        if list(new_order) == list(range(len(self.scans))):
+            return False
+        selected = {
+            self.list_scans.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in {item.row() for item in self.list_scans.selectedIndexes()}
+        }
+        old_to_new = {old: new for new, old in enumerate(new_order)}
+        for dock in self.plot_docks:
+            self._permute_encoding(getattr(dock.state, "encoding", None), old_to_new)
+        self.scans = [self.scans[i] for i in new_order]
+        if rebuild:
+            select = [i for i, scan in enumerate(self.scans) if id(scan) in selected]
+            self.rebuild_scan_list_widget(select_indices=select)
+        self._update_loaded_header()
+        return True
+
+    def _on_loaded_scans_rows_moved(self, *_args):
+        if self._syncing_scan_list or not self.scans:
+            return
+        id_to_old = {id(scan): i for i, scan in enumerate(self.scans)}
+        new_order = []
+        for row in range(self.list_scans.count()):
+            old = id_to_old.get(self.list_scans.item(row).data(Qt.ItemDataRole.UserRole))
+            if old is None:
+                return
+            new_order.append(old)
+        if len(new_order) != len(self.scans):
+            return
+        if self._apply_scan_order(new_order):
+            self.statusBar().showMessage("Scan order updated. Refresh to update plots.", 4000)
+
+    def _sort_loaded_scans(self, mode):
+        decorated = []
+        for i, scan in enumerate(self.scans):
+            name = (scan.name or "").replace("\\", "/").casefold()
+            ts = parse_scan_timestamp(getattr(scan, "path", None) or scan.name)
+            decorated.append((i, name, ts))
+        if mode == "name":
+            decorated.sort(key=lambda row: row[1])
+        elif mode == "newest":
+            decorated.sort(key=lambda row: (row[2] is None, -(row[2].timestamp() if row[2] else 0), row[1]))
+        else:
+            decorated.sort(key=lambda row: (row[2] is None, row[2] or datetime.max, row[1]))
+        if self._apply_scan_order([row[0] for row in decorated], rebuild=True):
+            self.statusBar().showMessage("Scan order updated. Refresh to update plots.", 4000)
+
+    def _scan_keys(self, scan):
+        keys = set()
+        name = (getattr(scan, "name", None) or "").replace("\\", "/").rstrip("/").casefold()
+        if name:
+            keys.add("name:" + name)
+        path = getattr(scan, "path", None)
+        if path and str(path).strip():
+            try:
+                resolved = str(Path(path).resolve()).casefold()
+            except OSError:
+                resolved = str(path).replace("\\", "/").rstrip("/").casefold()
+            if resolved:
+                keys.add("path:" + resolved)
+        return keys
+
+    def _unique_new_scans(self, new_scans):
+        seen = set()
+        for scan in self.scans:
+            seen |= self._scan_keys(scan)
+        unique = []
+        skipped = 0
+        for scan in new_scans:
+            keys = self._scan_keys(scan)
+            if keys and keys & seen:
+                skipped += 1
+                continue
+            seen |= keys
+            unique.append(scan)
+        return unique, skipped
 
     def _clamp_scan_values(self, enc, n):
         if not isinstance(enc, dict):
@@ -8345,15 +9143,25 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if failures:
             logging.warning("Some scans failed to load: %s", failures)
 
+        unique, skipped = self._unique_new_scans(new_scans)
+        fail_note = f" {len(failures)} failed to load." if failures else ""
+        if not unique:
+            self.statusBar().showMessage(
+                f"Skipped {skipped} scan(s) already loaded.{fail_note}", 4000
+            )
+            return
+
         start = len(self.scans)
-        self.scans.extend(new_scans)
+        self.scans.extend(unique)
         select = list(range(start, len(self.scans)))
         # if first load, select all; if appending, select the new ones plus previous selection
         prev = self.selected_scan_indices() if start > 0 else []
         self.rebuild_scan_list_widget(select_indices=sorted(set(prev) | set(select)))
         self._update_loaded_header()
+        skipped_note = f" Skipped {skipped} already loaded." if skipped else ""
         self.statusBar().showMessage(
-            f"Imported {len(new_scans)} scan(s). Refresh to update plots.", 4000
+            f"Imported {len(unique)} scan(s).{skipped_note}{fail_note} Refresh to update plots.",
+            4000,
         )
 
     def _sync_dock_ctrls_from_state(self, dock):
@@ -8450,7 +9258,18 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             assembled["x0"], assembled["y0"], assembled["w"], assembled["h"],
             xlabel=assembled["xlabel"], ylabel=assembled["ylabel"],
             dock=dock,
+            x_edges=assembled.get("x_edges"),
+            y_edges=assembled.get("y_edges"),
         )
+        time_side = assembled.get("time_axis")
+        if time_side:
+            self._set_time_axis(pw.getPlotItem(), time_side, True, dock.state)
+            self._set_plot_label(
+                pw.getPlotItem(),
+                "bottom" if time_side == "bottom" else "left",
+                assembled["xlabel"] if time_side == "bottom" else assembled["ylabel"],
+                dock.state,
+            )
         pw.setTitle(
             f"2D: {assembled.get('xlabel')} × {assembled.get('ylabel')}", **font
         )
@@ -8462,6 +9281,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         pw = dock.plot_widget
         if not isinstance(pw, PlotWidget):
             return
+        self._set_time_axis(pw.getPlotItem(), "bottom", False, dock.state)
+        self._set_time_axis(pw.getPlotItem(), "left", False, dock.state)
         enc = dock.state.encoding or {}
         if getattr(dock, "encoding_panel", None) is not None:
             x_kind, axis_i = parse_dim_id(enc.get("x_dim") or "axis:0")
@@ -8513,6 +9334,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         color_i = 0
         n_sel = len(scan_idxs)
+        time_epochs = self._epochs_for_scans([all_scans[i] for i in scan_idxs]) if kind == CURVES_X_TIME else None
         for s_i in scan_idxs:
             scan = all_scans[s_i]
             self._ensure_scan_plots(scan, curve_i)
@@ -8552,17 +9374,16 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         yerr.append(ye if np.isfinite(ye) else 0.0)
                     if not xs:
                         continue
-                    name = None
-                    if show_legend:
-                        name = short if n_sel > 1 else "data"
-                        if len(use_slices) > 1 and key:
-                            name = f"{name}[{','.join(f'{v:g}' for v in key)}]"
+                    ident = short
+                    if len(use_slices) > 1 and key:
+                        ident = f"{ident}[{','.join(f'{v:g}' for v in key)}]"
                     self._add_errorbar_scatter(
                         pw.getPlotItem(),
                         np.asarray(xs), np.asarray(ys), np.asarray(yerr) * 2,
                         y_centers=np.asarray(ys),
                         style=self._series_style(color_i),
-                        name=name,
+                        name=ident if show_legend else None,
+                        tip_id=ident,
                         view_style=dock.state.style,
                         show_errorbars=dock.state.show_errorbars,
                         series_out=dock.state.series_items,
@@ -8571,8 +9392,13 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 continue
 
             if kind == CURVES_X_TIME:
-                # Measurement vs scan index for multi-scan derived cubes
-                self._set_plot_label(pw.getPlotItem(), "bottom", "scan", dock.state)
+                if time_epochs is not None:
+                    self._set_time_axis(pw.getPlotItem(), "bottom", True, dock.state)
+                    self._set_plot_label(pw.getPlotItem(), "bottom", "scan time", dock.state)
+                    x_here = time_epochs[scan_idxs.index(s_i)]
+                else:
+                    self._set_plot_label(pw.getPlotItem(), "bottom", "scan", dock.state)
+                    x_here = float(s_i)
                 for roi in use_rois:
                     xs, ys, yerr = [], [], []
                     for slice_index in use_slices:
@@ -8581,20 +9407,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         )
                         if not np.isfinite(yv):
                             continue
-                        xs.append(float(s_i))
+                        xs.append(x_here)
                         ys.append(yv)
                         yerr.append(ye if np.isfinite(ye) else 0.0)
                     if not xs:
                         continue
-                    name = None
-                    if show_legend:
-                        name = f"ROI {roi}" if n_rois > 1 else short
+                    ident = f"{short}/R{roi}" if n_rois > 1 else short
                     self._add_errorbar_scatter(
                         pw.getPlotItem(),
                         np.asarray(xs), np.asarray(ys), np.asarray(yerr) * 2,
                         y_centers=np.asarray(ys),
                         style=self._series_style(color_i),
-                        name=name,
+                        name=ident if show_legend else None,
+                        tip_id=ident,
                         view_style=dock.state.style,
                         show_errorbars=dock.state.show_errorbars,
                         series_out=dock.state.series_items,
@@ -8620,26 +9445,26 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     x, y = scan.plots.get_data(slice_index, roi)
                     if not scan.metadata["key_sets"]:
                         x = np.arange(len(y))
-                    name = None
-                    if show_legend:
-                        if n_sel > 1 and n_rois > 1:
-                            name = f"{short}/R{roi}"
-                        elif n_sel > 1:
-                            name = short
-                        elif n_rois > 1:
-                            name = f"ROI {roi}"
-                        else:
-                            name = short
-                        if len(use_slices) > 1 and key:
-                            name = f"{name}[{','.join(f'{v:g}' for v in key)}]"
+                    if n_sel > 1 and n_rois > 1:
+                        ident = f"{short}/R{roi}"
+                    elif n_sel > 1:
+                        ident = short
+                    elif n_rois > 1:
+                        ident = f"ROI {roi}"
+                    else:
+                        ident = short
+                    if len(use_slices) > 1 and key:
+                        ident = f"{ident}[{','.join(f'{v:g}' for v in key)}]"
                     style = self._series_style(color_i)
                     if "survival" in scan.metadata["function"].lower():
                         self.plot_survival(
-                            x, y, style=style, name=name, plot_widget=pw, view_state=dock.state
+                            x, y, style=style, name=ident if show_legend else None,
+                            tip_id=ident, plot_widget=pw, view_state=dock.state,
                         )
                     else:
                         self.plot_errorbars(
-                            x, y, style=style, name=name, plot_widget=pw, view_state=dock.state
+                            x, y, style=style, name=ident if show_legend else None,
+                            tip_id=ident, plot_widget=pw, view_state=dock.state,
                         )
                     fit, *_ = scan.plots.get_fit(slice_index, roi)
                     if fit:
@@ -8681,6 +9506,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             view_style=dock.state.style,
             show_errorbars=dock.state.show_errorbars,
             series_out=dock.state.series_items,
+            tip_id="data",
         )
         self._apply_fit_overlays(dock)
 
@@ -8716,6 +9542,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     name=panel.get("label") if dock.state.show_legend else None,
                     view_style=view_style,
                     show_errorbars=show_eb,
+                    tip_id=panel.get("label"),
+                    point_ids=panel.get("point_ids"),
                 )
                 if panel.get("fit_x") is not None and panel.get("fit_y") is not None:
                     plot_item.plot(
@@ -8828,6 +9656,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     _, _, popt, perr = self.fitter.perform_fit(xp, yp, fitfunc, errors)
                     row = {
                         "scan": scan.name,
+                        "scan_label": self._scan_short_name(scan),
                         "roi": roi,
                         "time": ts.isoformat(sep=" ") if ts else "",
                         "t_index": s_i,
@@ -8870,7 +9699,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             if use_time:
                 p = glw.addPlot(
                     row=ax_i, col=0,
-                    axisItems={"bottom": DateAxisItem(orientation="bottom")},
+                    axisItems={"bottom": ScanDateAxisItem(orientation="bottom")},
                 )
             else:
                 p = glw.addPlot(row=ax_i, col=0)
@@ -8899,13 +9728,14 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         xval = datetime.fromisoformat(row["time"]).timestamp()
                     else:
                         xval = float(row["t_index"])
-                    points.append((xval, row[param], row[f"{param}_err"]))
+                    points.append((xval, row[param], row[f"{param}_err"], row.get("scan_label") or ""))
                 if not points:
                     continue
                 points.sort(key=lambda t: t[0])
                 xs = np.array([pt[0] for pt in points], dtype=float)
                 ys = np.array([pt[1] for pt in points], dtype=float)
                 yerr = np.array([pt[2] for pt in points], dtype=float)
+                point_ids = [pt[3] for pt in points]
                 if not np.any(np.isfinite(ys)):
                     continue
                 color = OVERLAY_COLORS[color_i % len(OVERLAY_COLORS)]
@@ -8915,6 +9745,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     name=f"ROI {roi}" if ax_i == 0 else None,
                     view_style=default_plot_style(),
                     show_errorbars=True,
+                    tip_id=f"ROI {roi}",
+                    point_ids=point_ids,
                 )
                 panel_series.append({
                     "plot_item": p,
@@ -8922,6 +9754,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     "y": ys,
                     "yerr": yerr,
                     "label": f"{param}/ROI{roi}",
+                    "point_ids": point_ids,
                 })
         title = f"Batch fit: {fitfunc}"
         rec = {
@@ -9056,6 +9889,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             )
             if ans != QMessageBox.StandardButton.Yes:
                 return
+        self.statusBar().showMessage(f"Loading {zip_path.stem}…")
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 raw = zf.read("experiment.json")
@@ -9090,50 +9924,76 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.curves_dock.state.xlabel = ui.get("xlabel") or ""
         self.curves_dock.state.ylabel = ui.get("ylabel") or ""
         self.curves_dock.state.show_legend = bool(ui.get("legend", False))
+        fitfunc = ui.get("fitfunc")
+        if fitfunc:
+            self.curves_dock.state.fitfunc = fitfunc
+        try:
+            x_index = int(ui.get("x_index", 0))
+        except (TypeError, ValueError):
+            x_index = 0
         name_to_i = {s.name: i for i, s in enumerate(self.scans)}
         sel = [name_to_i[n] for n in ui.get("scan_sel_names", []) if n in name_to_i]
         if not sel:
             sel = list(range(len(self.scans)))
         self.rebuild_scan_list_widget(select_indices=sel)
-        self.create_new_plot()
+        # One Curves draw. A later set_x() rebuilt every scan and drew again.
+        self.create_new_plot(x_index=x_index)
 
-        fitfunc = ui.get("fitfunc")
-        if fitfunc and getattr(self.curves_dock, "ctrls", None) is not None:
-            idx = self.curves_dock.ctrls.cob_fit.findText(fitfunc)
+        ctrls = getattr(self.curves_dock, "ctrls", None)
+        if fitfunc and ctrls is not None and getattr(ctrls, "cob_fit", None) is not None:
+            idx = ctrls.cob_fit.findText(fitfunc)
             if idx >= 0:
-                self.curves_dock.ctrls.cob_fit.setCurrentIndex(idx)
-            self.curves_dock.state.fitfunc = fitfunc
-        x_index = ui.get("x_index", 0)
-        if 0 <= x_index < self.cob_x.count():
+                ctrls.cob_fit.blockSignals(True)
+                ctrls.cob_fit.setCurrentIndex(idx)
+                ctrls.cob_fit.blockSignals(False)
+            self._sync_encoding_fit_params()
+        if 0 <= x_index < self.cob_x.count() and self.cob_x.currentIndex() != x_index:
             self.cob_x.setCurrentIndex(x_index)
-            self.set_x(x_index)
         if getattr(self.curves_dock, "style_panel", None) is not None:
             self.curves_dock.style_panel.sync_from_state(self.curves_dock.state)
-        # Refresh Curves dock control widgets from restored state
-        ctrls = getattr(self.curves_dock, "ctrls", None)
         if ctrls is not None:
-            if getattr(ctrls, "chk_legend", None):
-                ctrls.chk_legend.setChecked(self.curves_dock.state.show_legend)
-            if getattr(ctrls, "chk_errorbars", None):
-                ctrls.chk_errorbars.setChecked(self.curves_dock.state.show_errorbars)
+            for widget, checked in (
+                (getattr(ctrls, "chk_legend", None), self.curves_dock.state.show_legend),
+                (getattr(ctrls, "chk_errorbars", None), self.curves_dock.state.show_errorbars),
+            ):
+                if widget is None:
+                    continue
+                widget.blockSignals(True)
+                widget.setChecked(bool(checked))
+                widget.blockSignals(False)
             if getattr(ctrls, "cob_style", None):
                 mode = self.curves_dock.state.style.get("mode", "Scatter")
                 i = ctrls.cob_style.findText(mode)
                 if i >= 0:
+                    ctrls.cob_style.blockSignals(True)
                     ctrls.cob_style.setCurrentIndex(i)
-        slice_v = ui.get("slice", 0)
+                    ctrls.cob_style.blockSignals(False)
+        try:
+            slice_v = int(ui.get("slice", 0))
+        except (TypeError, ValueError):
+            slice_v = 0
+        self.scrollbar.blockSignals(True)
         self.scrollbar.setValue(min(slice_v, self.scrollbar.maximum()))
+        self.scrollbar.blockSignals(False)
         roi_sel = set(ui.get("roi_sel", [0]))
+        self.list_roi.blockSignals(True)
         for i in range(self.list_roi.count()):
             self.list_roi.item(i).setSelected(i in roi_sel)
+        self.list_roi.blockSignals(False)
 
         recipes = payload.get("tabs", [])
         self.tab_recipes = []
+        if recipes:
+            self.statusBar().showMessage("Restoring Derive…")
+            self.statusBar().repaint()
         for rec in recipes:
             try:
                 self._replay_tab_recipe(rec)
             except Exception as exc:
                 logging.warning("Could not restore tab %s: %s", rec.get("type"), exc)
+        self.statusBar().showMessage(
+            f"Loaded {payload.get('name', zip_path.stem)}", 4000
+        )
 
         layout_b64 = payload.get("dock_layout")
         if layout_b64:
@@ -9214,8 +10074,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             if "slice" in rec:
                 self.scrollbar.setValue(min(rec["slice"], self.scrollbar.maximum()))
             if "x_index" in rec and 0 <= rec["x_index"] < self.cob_x.count():
-                self.cob_x.setCurrentIndex(rec["x_index"])
-                self.set_x(rec["x_index"])
+                # setCurrentIndex already calls set_x when the axis changes.
+                # Same index with plots already built must not draw Curves again.
+                already = (
+                    self.cob_x.currentIndex() == rec["x_index"]
+                    and self.scans
+                    and self.scans[0].plots is not None
+                    and self.scans[0].plots.x_index == rec["x_index"]
+                )
+                if not already:
+                    if self.cob_x.currentIndex() != rec["x_index"]:
+                        self.cob_x.setCurrentIndex(rec["x_index"])
+                    else:
+                        self.set_x(rec["x_index"])
         if "fitfunc" in rec and getattr(self.curves_dock, "ctrls", None) is not None:
             idx = self.curves_dock.ctrls.cob_fit.findText(rec["fitfunc"])
             if idx >= 0:
