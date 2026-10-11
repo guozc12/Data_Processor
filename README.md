@@ -35,7 +35,7 @@ python _smoke_test_universal.py
 | Path | Role |
 |------|------|
 | `scan_plot_standalone.py` | Entire app: UI, loaders, fitters, experiments |
-| `_smoke_test_universal.py` | Offscreen regression for Encoding / Derive / Average |
+| `_smoke_test_universal.py` | Offscreen regression for Encoding / Derive / Average, Loaded scans delete/refresh, journal widths, figure export, and Oct 10–11 load timing |
 | `data/YYYY-MM-DD/scanHHMMSS/` | Raw scans (`log.csv` + `logResults.csv`) |
 | `experiments/*.zip` | Saved experiment packages (portable) |
 | `environment.yml` / `requirements.txt` | Runtime deps |
@@ -77,9 +77,10 @@ Built by `build_plots_for_scan(scan, x_index)`:
 
 Plotting:
 
-- Survival → `get_survival_rate` (Wilson-style) + asymmetric errors
-- Else → `get_errorbars` (mean ± SEM)
+- Survival → `get_survival_rate` (Wilson 68%, one `proportion_confint` call per series) + asymmetric errors
+- Else → `get_errorbars` (mean ± SEM), bins via a sort, not a mask per unique X
 - Empty / all-NaN bins skipped when drawing
+- Rectangular scans are grouped into slice lists inside `build_plots_for_scan`. Ragged ROI rows still use `Plots.add_point`.
 
 ---
 
@@ -88,23 +89,23 @@ Plotting:
 Layout: `ScanPlotApplet._rebuild_main_layout()`.
 
 - **No global Analyze toolbar.** Rename docks by **double-clicking the title bar**.
-- **Browser**: Import + Experiments only.
-- **Every plot** uses the same left sidebar template (Curves and Derive/Average docks).
+- **Browser**: current experiment's **Loaded scans** (Import / Delete / Refresh) plus saved **Experiments**.
+- **Every plot** uses the same left sidebar template (Curves and Derive/Average docks). Export / 2D / heatmap / batch docks use a control bar instead (journal, axis labels, Refresh, Copy).
 
-Mental model: **one plot = one multidimensional dataset**. Import → Curves uses the raw cube. Same-plot ops change the view; Derive ops open a **new** same-template plot, **tabified with the source plot**.
+Mental model: **Loaded scans is the current experiment.** If nothing has been saved, that experiment is temporary (`Unsaved`). Import and Delete change membership only. Plots stay as they were until **Refresh**. One plot is one view of that membership (or of a derived copy). Derive ops open a **new** same-template plot, **tabified with the source plot**.
 
 1. **Encoding**: Type (`XY` | `2D` | `ROI grid`) / axes / Dimensions
 2. **Derive**: Fit param… / Average… (new data → new plot)
-3. **Style**: Legend, Error bars, Mode
-4. **Analyze**: Fit / Clear fit / Export / Copy / Clear data…
+3. **Style**: Legend, Error bars, Mode, Journal, Column, X/Y labels
+4. **Analyze**: Fit / Clear fit / Refresh / Export / Copy / Clear data…
 
 ```
-┌─ Curves (or any plot) ────────────────┬─ Browser ─────────────┤
-│ Encoding │ plot                         │ Data: Import          │
-│ Derive   │                              │ Experiments           │
-│ Style    │                              │                       │
-│ Analyze  │                              │                       │
-└────────────────────────────────────────┴───────────────────────┘
+┌─ Curves (or any plot) ────────────────┬─ Browser ─────────────────┤
+│ Encoding │ plot                         │ Unsaved *                 │
+│ Derive   │                              │ Loaded scans              │
+│ Style    │                              │ Import / Delete / Refresh │
+│ Analyze  │                              │ Experiments               │
+└────────────────────────────────────────┴───────────────────────────┘
 ```
 
 - **Same plot**: Fit overlay, Style, Encoding Type/dims (no new dataset).
@@ -140,14 +141,17 @@ Nested Average (e.g. ROI then scan) keeps only dims still present on the source 
 - Style mode: **Scatter**
 - Legend: **on**
 - Error bars: **on**
-- Line width: **fixed 2**
+- Journal: **App** (dark pyqtgraph). Line width **2 px**.
+- Journal presets store `linewidth` in **points** and scale it to the widget so a 600 dpi export matches the physical size. See `JOURNAL_SPECS`.
 
 ### `PlotViewState` (on each `PlotDock.state`)
 
 | Field | Role |
 |-------|------|
 | `kind` | `curves` \| `derived_fit` \| `derived_avg` \| `export` \| `2d` \| `heatmap` \| `batch` |
-| `style` / `show_legend` / `show_errorbars` | View toggles |
+| `style` | `mode`, `journal` (`App`/`PRL`/`Nature`/`Optica`), `column`, `linewidth` |
+| `show_legend` / `show_errorbars` | View toggles |
+| `xlabel` / `ylabel` | Blank = automatic axis title. Non-blank disables pyqtgraph SI prefix on that axis |
 | `fitfunc` | Per-dock fit function name |
 | `cached_xy` / `fit_overlays` | Export / snapshot redraw |
 | `panel_series` | Batch vs-time multi-panel (+ optional `fit_x`/`fit_y`) |
@@ -159,26 +163,50 @@ Nested Average (e.g. ROI then scan) keeps only dims still present on the source 
 ### Curves dock
 
 - `closable=False` — cannot be dismissed from UI.
-- Starts **hidden**; import → `_show_curves_dock()` + `_relayout_main_docks()`.
+- Starts **hidden**. **Refresh** (or Load experiment) calls `_show_curves_dock()` + `_relayout_main_docks()`. Import alone does not.
 - Central widget is 0×0 so Left/Right docks own the client area.
 
 ### Multi-scan overlay
 
-- `self.scans`: loaded scans only (derived docks are **not** listed).
-- Colors: `OVERLAY_COLORS`.
-- `primary_scan()` = first selected (or `scans[0]`).
+- `self.scans`: members of the current experiment (derived docks are **not** listed).
+- `selected_scan_indices()` is **every** loaded scan. Plot filtering is the Encoding scan dim, not the list selection. List selection is only for Delete.
+- Colors: `OVERLAY_COLORS` for App. Journal presets use `WONG_COLORS` plus distinct markers and dash patterns.
+- `primary_scan()` = `scans[0]`.
+
+### Loaded scans (current experiment)
+
+`list_scans` is visible in the Browser. The header is the zip name, or `Unsaved`. A trailing `*` means membership differs from the last Save/Load (`_membership_dirty` vs `_clean_scan_names`).
+
+| Action | Effect |
+|--------|--------|
+| **Import** | Append scans. Does **not** redraw. Status bar says to Refresh. |
+| **Delete** | Remove selected rows from `self.scans` only (disk files stay). Remap Encoding `dims["scan"]["values"]`. Does **not** redraw. Delete-all calls `clear_scans`. |
+| **Refresh** (list) | `refresh_all_plots`: redraw Curves, then each other dock in place. |
+| **Refresh** (plot) | `refresh_plot_dock`: that dock only. Keeps its Encoding, journal, axis labels, and fit function. Re-fits if a fit was already present. |
+
+Curves refresh does **not** call `create_new_plot` (that resets Encoding). It clamps scan indices, rebuilds plots for the current X, then `draw_plot`.
+
+Recipe docks (`export` / `2d` / `heatmap` / `batch`) refresh by replaying the recipe into the **same** dock (`_refreshing_dock` makes `show_plot_dock` swap the widget and `_record_tab_recipe` skip a new entry). A recipe whose `scan_name` / `scan_sel_names` are all gone is skipped with a status message. Derived docks redraw their stored copy; they are not recomputed from the new membership.
 
 ### Clear data…
 
 Analyze → **Clear data…**: confirm → wipe loaded scans and close analysis docks.
 
-Import: `ScanPickerDialog` with filter + sort (Name/Date).
+Import picker: `ScanPickerDialog` with filter + sort (Name/Date).
+
+- `discover_scan_dirs` is cached for the process (`_scan_dir_cache`). The dialog paints first, then fills. A second Import in the same process does not walk `data/` again.
+- The picker's **Refresh** passes `refresh=True` and is the way to see scans written after the cache was filled. That is not the Loaded-scans Refresh.
+- The filter waits 200 ms (`_filter_timer`) before rebuilding the list. Do not connect `textChanged` straight to `apply_filter_sort`.
+- First open still walks the whole tree on the UI thread (about 2 s for ~10k folders). The list is a normal `QListWidget`, not a virtual model.
 
 ### Theme
 
 - `APP_STYLESHEET` + `_style_plot_item`
 - Images: viridis + `ColorBarItem`
 - Legend click toggles curve **and** linked `ErrorBarItem` (`link_curve_errorbar`)
+- Curves redraws (`_draw_plot_vs_axis` / `_vs_roi` / `_vs_time`) add every series inside `_batch_plot_items`: legend `updateSize` and view auto-range run **once** after the batch, then `ViewBox.autoRange()`.
+
+`create_new_plot` and `_apply_curves_encoding_from_panel` call `draw_plot` only when `_sync_legacy_from_encoding` did not already draw via `set_x`. `set_x` returns whether a draw ran. Do not add a second unconditional `draw_plot()` after that bridge.
 
 ---
 
@@ -190,10 +218,25 @@ Import: `ScanPickerDialog` with filter + sort (Name/Date).
 - Right-click Fit → `FittingDialog` (guess/fixed params).
 - Guards: ≥2 finite points; `sanity_check_fit`; clipped fit y for autoRange.
 
-### Export / Copy
+### Style / axis labels
 
-- **Export**: binned curve → Export dock + TSV; copies style/fit prefs.
-- **Copy ▾**: image (Ctrl+C) / raw data (Ctrl+A) via `_dock_copy_raw`.
+`StylePanel` (and the export/2D control bar) writes `style["journal"]`, `style["column"]`, `xlabel`, `ylabel`.
+
+| Journal | Font | Text | Line | Columns |
+|---------|------|------|------|---------|
+| PRL | Times New Roman | 9 pt (APS lettering ≥ 2 mm) | 0.5 pt | 3.375 in; 2-col **7.0 in DERIVED** (REVTeX text width) |
+| Nature | Arial | 7 pt | 0.75 pt | 89 mm, 130 mm (1.5), 183 mm |
+| Optica | Arial | 8 pt | 0.75 pt | 8.3 cm; 2-col **17.1 cm DERIVED** |
+
+`App` stays the dark theme. On screen the dock still fills the window; `journal_paint_px` scales fonts, line width, and 1 mm markers so a 600 dpi export lands on those physical sizes. Do not store journal line width as raw pixels.
+
+Blank X/Y label keeps the automatic title (`_set_plot_label`). A typed label calls `enableAutoSIPrefix(False)`.
+
+### Export / Copy / Save figure
+
+- **Export**: binned curve → Export dock + TSV; copies style, axis labels, and fit prefs. Still means "snapshot", not a file.
+- **Copy ▾**: image (Ctrl+C) / raw data (Ctrl+A) / **Save figure…**.
+- **Save figure…** (`save_figure` → `_write_figure`): PNG and LZW TIFF at column width × 600 dpi (`ImageExporter`); SVG (pyqtgraph, then Qt `QSvgGenerator` if that exporter throws); PDF via `QPdfWriter` + `widget.render`. App style uses the widget's pixel size, not a journal column.
 
 ### Legacy recipe-only paths (no main UI)
 
@@ -209,7 +252,9 @@ Prefer Encoding Type=`2D` / `ROI grid` and Derive Fit param… for new work. Do 
 
 ## Experiments (save / load)
 
-Browser: list `experiments/*.zip`; Save / Load / Refresh; double-click load; RMB Open / Duplicate / Delete / Reveal.
+Browser bottom: list `experiments/*.zip`; Save / Load / Refresh; double-click load; RMB Open / Duplicate / Delete / Reveal.
+
+**Load** calls `open_experiment`. If `_membership_dirty()`, it asks before replacing the current list. Cancel leaves the unsaved scans in place.
 
 ### Package (`experiment.json` inside zip)
 
@@ -223,7 +268,9 @@ Browser: list `experiments/*.zip`; Save / Load / Refresh; double-click load; RMB
     "fitfunc": "Gauss",
     "slice": 0,
     "legend": true,
-    "style": {"mode": "Scatter", "linewidth": 2.0},
+    "style": {"mode": "Scatter", "linewidth": 2.0, "journal": "App", "column": "1-col"},
+    "xlabel": "",
+    "ylabel": "",
     "scan_sel_names": ["..."],
     "roi_sel": [0, 1]
   },
@@ -233,7 +280,8 @@ Browser: list `experiments/*.zip`; Save / Load / Refresh; double-click load; RMB
 }
 ```
 
-- Scans fully embedded (portable).
+- Scans fully embedded (portable). `scan_sel_names` is the full membership at save time.
+- Save drops recipes whose `scan_name` / `scan_sel_names` no longer match `self.scans`, and stamps each remaining recipe with that dock's `style`, `xlabel`, and `ylabel`.
 - Recipes replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch`). Old `derived_merge` / `derived_global` recipes are skipped.
 - v1 zips still load (no `dock_layout`).
 - Closing an analysis dock drops its recipe from `self.tab_recipes`.
@@ -290,8 +338,13 @@ Secondary plots = pyqtgraph in `PlotDock`s only.
 | `derive_fit_param_plot` / `_compute_derive_points` | Fit-param Derive |
 | `average_cube_dims` / `_average_scans_over_dims` / `_average_derived_points_over_dims` | Average… |
 | `draw_plot` / `_redraw_universal_dock` / `_redraw_derived_dock` | Rendering |
-| `import_data` / `ScanPickerDialog` | Load scans |
-| `save_experiment` / `open_experiment` | Experiment zip I/O (v2) |
+| `import_data` / `ScanPickerDialog` / `discover_scan_dirs` | Append scans; directory list cached until the picker's Refresh |
+| `_delete_loaded_scans` / `refresh_all_plots` / `refresh_plot_dock` | Membership edit and manual plot sync |
+| `JOURNAL_SPECS` / `journal_paint_px` / `_set_plot_label` | Journal figure geometry and axis-label override |
+| `save_figure` / `_write_figure` | PNG, TIFF, SVG, PDF |
+| `get_survival_rate` / `get_errorbars` / `_roi_data_totals` | Binned Y and which ROIs have data |
+| `_batch_plot_items` | One legend layout + one auto-range per Curves redraw |
+| `save_experiment` / `open_experiment` | Experiment zip I/O (v2); Load confirms if membership is dirty |
 | `Fitter` / `sanity_check_fit` | Curve fitting |
 
 ---
@@ -303,7 +356,7 @@ Only do these if the user asks:
 1. Embed Derive/Average docks fully in experiment zip (points + reduced cubes).
 2. Promote derived → Loaded scans (explicit action).
 3. Full encoding shelf (explicit Color/Y channels).
-4. Import dialog virtualization (slow with ~10k scans).
+4. Import dialog virtualization. Cache and filter debounce are in place; the **first** Import of ~10k folders is still a UI-thread walk (~2 s). A virtual list only matters if that first fill or scrolling the full list becomes the problem.
 5. Drop recipe+Ctrl+Q for legacy `two_d_plot` / heatmap / batch once unused.
 6. Optional module split if file size blocks work.
 7. Title rename UX polish.
@@ -313,10 +366,10 @@ Only do these if the user asks:
 ## Verification habits
 
 1. Restart GUI after edits.
-2. Smoke: Import → Encoding XY Fit/Style → Type 2D → Type ROI grid → Fit param… → Average… (incl. on Fit plot) → nested Average → Export → Clear data → Load exp.
+2. Smoke: Import → Refresh → Encoding XY Fit/Style → Journal + axis label → Type 2D → Type ROI grid → Fit param… → Average… (incl. on Fit plot) → nested Average → Export → Save figure → Delete a scan → Refresh → Clear data → Load exp (confirm if dirty).
 3. Watch `TypeError: takes N positional arguments but M were given` on new button slots.
 4. Prefer `logging` with scan name + ROI; status bar for user-facing results.
-5. Run `_smoke_test_universal.py` offscreen after Derive/Average/Encoding changes.
+5. Run `_smoke_test_universal.py` offscreen after Derive/Average/Encoding, Loaded-scans, or figure-export changes. It also times Import cache (second open must not walk) and `create_new_plot` on every scan under `data/2026-10-10` and `data/2026-10-11` (one `draw_plot`). Wilson values must stay identical to a single `proportion_confint(..., method="wilson")` per bin. Later cases check journal column widths, that Delete does not call `draw_plot`, axis-label overrides, a PNG write, and that Load with a dirty list can be cancelled.
 
 ---
 

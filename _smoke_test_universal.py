@@ -1,13 +1,16 @@
 """Headless regression for universal plotter. Uses synthetic + real data."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QMessageBox
 import numpy as np
 
@@ -746,6 +749,225 @@ def main():
         assert got["y_channel"] == "fit:A", got
 
     run("preserve_fit_y_channel", t_encoding_type_preserves_y_fit_on_derived)
+
+    def t_import_cache_and_oct_load():
+        """Time Import index cache and one plot of every 2026-10-10..11 scan.
+
+        Cold open walks data/ once. The next open must not walk again.
+        create_new_plot must draw once (set_x already draws on rebuild).
+        """
+        sp._scan_dir_cache.clear()
+        walks = {"n": 0}
+        orig_walk = sp.os_walk_safe
+
+        def counting_walk(root):
+            walks["n"] += 1
+            return orig_walk(root)
+
+        sp.os_walk_safe = counting_walk
+        dlg1 = dlg2 = None
+        try:
+            t0 = time.perf_counter()
+            dlg1 = sp.ScanPickerDialog(ROOT / "data")
+            dlg1.show()
+            for _ in range(20):
+                app.processEvents()
+                if dlg1.list_widget.count():
+                    break
+            t_cold = time.perf_counter() - t0
+            if dlg1.list_widget.count() < 1000:
+                raise AssertionError(f"import list too small: {dlg1.list_widget.count()}")
+            if walks["n"] != 1:
+                raise AssertionError(f"cold import walked {walks['n']} times")
+
+            t0 = time.perf_counter()
+            dlg2 = sp.ScanPickerDialog(ROOT / "data")
+            dlg2.show()
+            for _ in range(20):
+                app.processEvents()
+                if dlg2.list_widget.count():
+                    break
+            t_warm = time.perf_counter() - t0
+            if walks["n"] != 1:
+                raise AssertionError(f"warm import walked again (total {walks['n']})")
+            if dlg2.list_widget.count() != dlg1.list_widget.count():
+                raise AssertionError("cached import list size changed")
+            if not (t_warm < 1.0 and t_warm < t_cold / 2):
+                raise AssertionError(
+                    f"warm import not faster: cold={t_cold:.2f}s warm={t_warm:.2f}s"
+                )
+
+            n_all = dlg2.list_widget.count()
+            dlg2.ed_filter.setText("2026-10-11")
+            app.processEvents()
+            if dlg2.list_widget.count() != n_all:
+                raise AssertionError("filter rebuilt the list before the debounce")
+            QTest.qWait(350)
+            n_hit = dlg2.list_widget.count()
+            if not (0 < n_hit < n_all):
+                raise AssertionError(f"filter 2026-10-11 matched {n_hit} / {n_all}")
+            for i in range(n_hit):
+                text = dlg2.list_widget.item(i).text()
+                if "2026-10-11" not in text:
+                    raise AssertionError(f"filter leaked row {text}")
+        finally:
+            sp.os_walk_safe = orig_walk
+            for dlg in (dlg1, dlg2):
+                if dlg is not None:
+                    dlg._filter_timer.stop()
+                    dlg.close()
+                    dlg.deleteLater()
+            for _ in range(5):
+                app.processEvents()
+
+        day_dirs = []
+        for day in ("2026-10-10", "2026-10-11"):
+            day_root = ROOT / "data" / day
+            if not day_root.is_dir():
+                raise AssertionError(f"missing {day_root}")
+            day_dirs.extend(sp.discover_scan_dirs(day_root))
+        if not day_dirs:
+            raise AssertionError("no scans on 2026-10-10..11")
+
+        prev_disable = logging.root.manager.disable
+        logging.disable(logging.WARNING)
+        try:
+            t0 = time.perf_counter()
+            scans = [
+                sp.load_scan_pair(d / "log.csv", d / "logResults.csv") for d in day_dirs
+            ]
+            t_load = time.perf_counter() - t0
+        finally:
+            logging.disable(prev_disable)
+
+        draws = {"n": 0}
+        orig_draw = win.draw_plot
+
+        def counting_draw():
+            draws["n"] += 1
+            return orig_draw()
+
+        win.draw_plot = counting_draw
+        try:
+            win.scans = list(scans)
+            win.rebuild_scan_list_widget(select_indices=list(range(len(scans))))
+            t0 = time.perf_counter()
+            win.create_new_plot()
+            for _ in range(8):
+                app.processEvents()
+            t_plot = time.perf_counter() - t0
+        finally:
+            win.draw_plot = orig_draw
+
+        if draws["n"] != 1:
+            raise AssertionError(f"draw_plot called {draws['n']} times on load")
+        items = win.pw_plot.getPlotItem().listDataItems() or win.pw_plot.getPlotItem().items
+        if not items:
+            raise AssertionError("oct10-11 plot is empty")
+        n_series = len(win.curves_dock.state.series_items)
+        print(
+            f"TIMING import cold={t_cold:.2f}s warm={t_warm:.2f}s walks={walks['n']} | "
+            f"oct10-11 scans={len(scans)} load={t_load:.2f}s plot={t_plot:.2f}s "
+            f"series={n_series} draws={draws['n']}"
+        )
+
+    run("import_cache_and_oct_load", t_import_cache_and_oct_load)
+
+    def t_journal_widths():
+        prl = sp.journal_column_width_in({"journal": "PRL", "column": "1-col"})
+        if abs(prl - 3.375) > 1e-6:
+            raise AssertionError(prl)
+        nature = sp.journal_column_width_in({"journal": "Nature", "column": "1-col"})
+        if abs(nature - 89 / 25.4) > 1e-6:
+            raise AssertionError(nature)
+        optica = sp.journal_column_width_in({"journal": "Optica", "column": "1-col"})
+        if abs(optica - 8.3 / 2.54) > 1e-6:
+            raise AssertionError(optica)
+        if sp.journal_column_width_in({"journal": "App"}) is not None:
+            raise AssertionError("App style has no physical width")
+        if sp.JOURNAL_SPECS["PRL"]["fontsize_pt"] != 9:
+            raise AssertionError("PRL lettering must be 9 pt to clear 2 mm")
+        if "1.5-col" not in sp.JOURNAL_SPECS["Nature"]["columns"]:
+            raise AssertionError("Nature is missing the 1.5 column width")
+
+    run("journal_widths", t_journal_widths)
+
+    def t_delete_and_refresh():
+        s1 = make_synth_scan("keep_me")
+        s2 = make_synth_scan("drop_me")
+        load_win_with_scans(win, [s1, s2])
+        win.curves_dock.state.encoding.setdefault("dims", {})["scan"] = {
+            "mode": sp.DIM_MODE_MULTI, "values": [0, 1],
+        }
+        win.list_scans.clearSelection()
+        win.list_scans.item(1).setSelected(True)
+        draws = {"n": 0}
+        orig = win.draw_plot
+        def counting():
+            draws["n"] += 1
+            return orig()
+        win.draw_plot = counting
+        try:
+            win._delete_loaded_scans()
+        finally:
+            win.draw_plot = orig
+        if draws["n"] != 0:
+            raise AssertionError("delete should not redraw")
+        if [s.name for s in win.scans] != ["keep_me"]:
+            raise AssertionError(win.scans)
+        vals = win.curves_dock.state.encoding["dims"]["scan"]["values"]
+        if vals != [0]:
+            raise AssertionError(vals)
+        win.curves_dock.state.xlabel = "detuning (MHz)"
+        win.curves_dock.state.ylabel = "survival"
+        win.refresh_plot_dock(win.curves_dock)
+        bottom = win.pw_plot.getPlotItem().getAxis("bottom").label.toPlainText().strip()
+        left = win.pw_plot.getPlotItem().getAxis("left").label.toPlainText().strip()
+        if bottom != "detuning (MHz)" or left != "survival":
+            raise AssertionError((bottom, left))
+        if not win._membership_dirty():
+            raise AssertionError("delete should mark the experiment dirty")
+
+    run("delete_refresh_labels", t_delete_and_refresh)
+
+    def t_save_figure_png():
+        import tempfile
+        win.curves_dock.state.style["journal"] = "PRL"
+        win.curves_dock.state.style["column"] = "1-col"
+        out = Path(tempfile.mkdtemp()) / "fig.png"
+        win._write_figure(win.pw_plot, str(out), win.curves_dock.state.style)
+        if not out.is_file() or out.stat().st_size < 100:
+            raise AssertionError("png was not written")
+        win.curves_dock.state.style["journal"] = "App"
+
+    run("save_figure_png", t_save_figure_png)
+
+    def t_load_confirm():
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        orig_dir = sp.EXPERIMENTS_DIR
+        orig_q = sp.QMessageBox.question
+        sp.EXPERIMENTS_DIR = tmp
+        try:
+            load_win_with_scans(win, [make_synth_scan("saved_a")])
+            win._experiment_name = None
+            win._clean_scan_names = ["saved_a"]
+            win.ed_exp_name.setText("guard_exp")
+            win.save_experiment()
+            win.scans.append(make_synth_scan("extra"))
+            win.rebuild_scan_list_widget()
+            if not win._membership_dirty():
+                raise AssertionError("extra scan should be unsaved")
+            sp.QMessageBox.question = lambda *_a, **_k: sp.QMessageBox.StandardButton.No
+            win.list_experiments.setCurrentRow(0)
+            win.open_experiment()
+            if [s.name for s in win.scans] != ["saved_a", "extra"]:
+                raise AssertionError([s.name for s in win.scans])
+        finally:
+            sp.QMessageBox.question = orig_q
+            sp.EXPERIMENTS_DIR = orig_dir
+
+    run("load_confirms_unsaved", t_load_confirm)
 
     print("\n==== SUMMARY ====")
     n_fail = sum(1 for _, o in results if not o)
