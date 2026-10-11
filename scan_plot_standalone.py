@@ -511,7 +511,10 @@ def sanity_check_fit(fitfunc, popt, x, y):
     if len(x) < 2:
         return "not enough points"
     xspan = float(np.nanmax(x) - np.nanmin(x)) or 1.0
-    yspan = float(np.nanmax(y) - np.nanmin(y)) or 1.0
+    raw_yspan = float(np.nanmax(y) - np.nanmin(y))
+    if not np.isfinite(raw_yspan) or raw_yspan == 0.0:
+        return "flat data"
+    yspan = raw_yspan
     yspan = max(yspan, abs(float(np.nanmean(y))) * 0.1 + 1e-12)
     popt = np.asarray(popt, dtype=float)
     if not np.all(np.isfinite(popt)):
@@ -2716,6 +2719,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         curves_outer.setContentsMargins(0, 0, 0, 0)
         curves_outer.setSpacing(0)
         self.curves_dock = PlotDock("Curves", "curves", curves_page, parent=self, closable=False)
+        # saveState matches docks by objectName. id(self) changes every process.
+        self.curves_dock.setObjectName("PlotDock_curves")
         self.curves_dock.activated.connect(self.set_focused_dock)
         self.curves_dock.state.encoding = default_encoding()
 
@@ -3666,7 +3671,15 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         axis = plot_item.getAxis(side)
         if hasattr(axis, "enableAutoSIPrefix"):
             # A typed label is shown as written. Automatic labels keep SI prefixes.
-            axis.enableAutoSIPrefix(not custom)
+            # enableAutoSIPrefix(False) still runs updateAutoSIPrefix and freezes
+            # a scale from the current range (1e-18 after a 1e19 autorange). Later
+            # zooms then print that scale, so ±2000 Hz becomes ±2e-15.
+            if custom:
+                axis.autoSIPrefix = False
+                axis.autoSIPrefixScale = 1.0
+                axis.labelUnitPrefix = ""
+            else:
+                axis.enableAutoSIPrefix(True)
         width = journal_widget_px(plot_item)
         plot_item.setLabel(side, text, units=None, **self._label_font(view_state, width))
 
@@ -3896,6 +3909,22 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         err_item = None
         idx = np.isfinite(heights) & (heights > 0)
+        if np.any(idx):
+            # A failed covariance can be 1e19 while the points span a few kHz.
+            # Those bars are not a useful uncertainty and they autorange the axis
+            # out to ±1e19, which then poisons tick scaling.
+            y_finite = y_centers[np.isfinite(y_centers)]
+            if y_finite.size:
+                yspan = float(np.nanmax(y_finite) - np.nanmin(y_finite))
+                yscale = max(yspan, float(np.nanmedian(np.abs(y_finite))), 1e-9)
+            else:
+                yscale = 1.0
+            med_h = float(np.nanmedian(heights[idx]))
+            # A single failed covariance can be 1e4–1e19 while the typical bar
+            # is ~100 Hz. Keep bars near the series median; always allow a
+            # small fraction of the data span.
+            cap = max(50.0 * med_h, 0.05 * yscale, 1e-9)
+            idx = idx & (heights <= cap)
         if show_errorbars and np.any(idx):
             beam = 0.007 * (unique_x.max() - unique_x.min()) if len(unique_x) else 0.01
             err_pen = plot_kw.get("pen")
@@ -6960,6 +6989,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             "fit_along": fit_along_id,
             "source_encoding": src_enc,
         }
+        # Fit of an already-reduced cube (Avg: ROI, …). Reload must rebuild
+        # that cube; the source encoding alone no longer names the collapsed ROI.
+        if src_scans and isinstance(getattr(dock.state, "recipe", None), dict):
+            recipe["parent"] = copy.deepcopy(dock.state.recipe)
         self._record_tab_recipe(recipe, dock=out)
         if src_scans:
             out._fit_source_scans = src_scans
@@ -7088,10 +7121,17 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                 catalog=out_cat,
                 source_dock=dock,
             )
-            self._record_tab_recipe(
-                {"type": "average", "title": title, "dims": list(dim_ids), "from": "fit_points"},
-                dock=out,
-            )
+            avg_rec = {
+                "type": "average",
+                "title": title,
+                "dims": list(dim_ids),
+                "from": "fit_points",
+                "source_encoding": copy.deepcopy(enc),
+                "result_encoding": copy.deepcopy(new_enc),
+            }
+            if isinstance(getattr(dock.state, "recipe", None), dict):
+                avg_rec["parent"] = copy.deepcopy(dock.state.recipe)
+            self._record_tab_recipe(avg_rec, dock=out)
             self._redraw_universal_dock(out)
             self.statusBar().showMessage(
                 f"Averaged over {', '.join(labels)} · {len(reduced_pts)} points",
@@ -7162,10 +7202,16 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             catalog=out_cat,
             source_dock=dock,
         )
-        self._record_tab_recipe(
-            {"type": "average", "title": title, "dims": list(dim_ids)},
-            dock=out,
-        )
+        avg_rec = {
+            "type": "average",
+            "title": title,
+            "dims": list(dim_ids),
+            "source_encoding": copy.deepcopy(enc),
+            "result_encoding": copy.deepcopy(new_enc),
+        }
+        if isinstance(getattr(dock.state, "recipe", None), dict):
+            avg_rec["parent"] = copy.deepcopy(dock.state.recipe)
+        self._record_tab_recipe(avg_rec, dock=out)
         self._redraw_universal_dock(out)
         self.statusBar().showMessage(
             f"Averaged over {', '.join(labels)}"
@@ -7774,6 +7820,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     except Exception as exc:
                         logging.debug("Derive fit failed: %s", exc)
                         continue
+                    ye = float(perr[p_i])
+                    if not (np.isfinite(popt[p_i]) and np.isfinite(ye)):
+                        # An unconstrained center (infinite covariance) is not a
+                        # resonance. Recording yerr=0 drew it as an exact point
+                        # on the detuning grid.
+                        continue
                     # Outer X coordinate
                     if nx_kind == "roi":
                         xv = float(roi)
@@ -7811,7 +7863,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         "x": xv,
                         "x_dim": new_x_dim,
                         "y": float(popt[p_i]),
-                        "yerr": float(perr[p_i]) if np.isfinite(perr[p_i]) else 0.0,
+                        "yerr": ye,
                         "label": label,
                         "scan_i": s_i,
                         "roi": roi,
@@ -8806,6 +8858,108 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if rec.get("scan_name") and rec["scan_name"] not in names:
             return None
         return rec
+
+    def _qstrings_in_blob(self, raw):
+        """QDataStream QString entries: big-endian length, then UTF-16BE text."""
+        found = []
+        i = 0
+        n = len(raw)
+        while i + 4 <= n:
+            length = int.from_bytes(raw[i:i + 4], "big")
+            if length == 0xFFFFFFFF:
+                i += 4
+                continue
+            if 0 < length <= 400 and length % 2 == 0 and i + 4 + length <= n:
+                try:
+                    text = raw[i + 4:i + 4 + length].decode("utf-16be")
+                except Exception:
+                    i += 1
+                    continue
+                if text and all(ch.isprintable() for ch in text):
+                    found.append(text)
+                    i += 4 + length
+                    continue
+            i += 1
+        return found
+
+    def _layout_dock_names(self, layout_b64):
+        try:
+            raw = base64.b64decode(layout_b64)
+        except Exception:
+            return []
+        return [s for s in self._qstrings_in_blob(raw) if s.startswith("PlotDock_")]
+
+    def _dock_name_is_unstable(self, name):
+        match = re.fullmatch(r"PlotDock_.+_(\d+)", name or "")
+        return bool(match and int(match.group(1)) >= 1_000_000)
+
+    def _assign_stable_dock_object_name(self, dock):
+        """Give a dock a name that saveState can find again after reload."""
+        if getattr(dock.state, "kind", "") == "curves":
+            dock.setObjectName("PlotDock_curves")
+            return
+        rec = dock.state.recipe if isinstance(getattr(dock.state, "recipe", None), dict) else None
+        saved = rec.get("dock_object_name") if rec else None
+        if (
+            isinstance(saved, str)
+            and saved.startswith("PlotDock_")
+            and not self._dock_name_is_unstable(saved)
+        ):
+            dock.setObjectName(saved)
+            return
+        current = dock.objectName() or ""
+        if current.startswith("PlotDock_") and not self._dock_name_is_unstable(current):
+            if rec is not None:
+                rec["dock_object_name"] = current
+            return
+        kind = re.sub(r"[^A-Za-z0-9_]", "_", getattr(dock.state, "kind", None) or "plot")
+        used = {d.objectName() for d in self.plot_docks}
+        browser = getattr(self, "browser_dock", None)
+        if browser is not None:
+            used.add(browser.objectName())
+        n = 1
+        while f"PlotDock_{kind}_{n}" in used:
+            n += 1
+        name = f"PlotDock_{kind}_{n}"
+        dock.setObjectName(name)
+        if rec is not None:
+            rec["dock_object_name"] = name
+
+    def _prepare_dock_names_for_restore(self, recipes, layout_b64):
+        """Match new docks to the names stored in a saved QMainWindow state."""
+        has_stable = False
+        for rec in recipes or []:
+            if not isinstance(rec, dict):
+                continue
+            name = rec.get("dock_object_name")
+            if (
+                isinstance(name, str)
+                and name.startswith("PlotDock_")
+                and not self._dock_name_is_unstable(name)
+            ):
+                has_stable = True
+                break
+        if has_stable:
+            self.curves_dock.setObjectName("PlotDock_curves")
+            return
+        self._adopt_layout_dock_names(layout_b64)
+
+    def _adopt_layout_dock_names(self, layout_b64):
+        """Older files stored PlotDock_<kind>_<id(self)>. Reuse the newest names."""
+        by_kind = {}
+        for name in self._layout_dock_names(layout_b64):
+            match = re.fullmatch(r"PlotDock_(.+)_(\d+)", name)
+            if not match:
+                continue
+            by_kind.setdefault(match.group(1), {})[int(match.group(2))] = name
+        groups = {}
+        for dock in self.plot_docks:
+            groups.setdefault(dock.state.kind, []).append(dock)
+        for kind, docks in groups.items():
+            pairs = sorted((by_kind.get(kind) or {}).items())
+            chosen = pairs[-len(docks):]
+            for dock, (_num, name) in zip(docks, chosen):
+                dock.setObjectName(name)
 
     def _recipes_for_save(self):
         for dock in self.plot_docks:
@@ -9839,6 +9993,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
+        for dock in self.plot_docks:
+            self._assign_stable_dock_object_name(dock)
         dock_layout = base64.b64encode(bytes(self.saveState())).decode("ascii")
         payload = {
             "version": 2,
@@ -9987,16 +10143,25 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.statusBar().showMessage("Restoring Derive…")
             self.statusBar().repaint()
         for rec in recipes:
+            before_ids = {id(d) for d in self.plot_docks}
             try:
                 self._replay_tab_recipe(rec)
             except Exception as exc:
                 logging.warning("Could not restore tab %s: %s", rec.get("type"), exc)
+            saved_name = rec.get("dock_object_name") if isinstance(rec, dict) else None
+            if isinstance(saved_name, str) and saved_name.startswith("PlotDock_"):
+                for dock in self.plot_docks:
+                    if id(dock) not in before_ids:
+                        dock.setObjectName(saved_name)
+                        if isinstance(dock.state.recipe, dict):
+                            dock.state.recipe["dock_object_name"] = saved_name
         self.statusBar().showMessage(
             f"Loaded {payload.get('name', zip_path.stem)}", 4000
         )
 
         layout_b64 = payload.get("dock_layout")
         if layout_b64:
+            self._prepare_dock_names_for_restore(recipes, layout_b64)
             try:
                 self.restoreState(QByteArray(base64.b64decode(layout_b64)))
             except Exception as exc:
@@ -10011,6 +10176,122 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if matches:
             self.list_experiments.setCurrentItem(matches[0])
 
+    def _materialize_recipe(self, rec, _depth=0):
+        """Rebuild a saved Average/Derive cube without opening a dock.
+
+        Returns ("scans", [ScanDataset, ...]) or ("points", [dict, ...]).
+        """
+        if _depth > 6 or not isinstance(rec, dict):
+            return None
+        parent_cube = None
+        if isinstance(rec.get("parent"), dict):
+            parent_cube = self._materialize_recipe(rec["parent"], _depth + 1)
+        rtype = rec.get("type")
+        if rtype == "derive":
+            src = copy.deepcopy(rec.get("source_encoding") or {})
+            scans = parent_cube[1] if parent_cube and parent_cube[0] == "scans" else None
+            points = self._compute_derive_points(
+                src, rec.get("fitfunc"), rec.get("param"), rec.get("x_dim"), scans=scans,
+            )
+            return ("points", points)
+        if rtype != "average":
+            return None
+        enc = copy.deepcopy(rec.get("source_encoding") or {})
+        if not enc:
+            enc = copy.deepcopy(
+                getattr(self.curves_dock.state, "encoding", None) or default_encoding()
+            )
+        dim_ids = list(rec.get("dims") or [])
+        if rec.get("from") == "fit_points":
+            if not parent_cube or parent_cube[0] != "points":
+                return ("points", [])
+            scoped = self._points_in_average_selection(parent_cube[1], enc, dim_ids)
+            return ("points", self._average_derived_points_over_dims(scoped, dim_ids))
+        if parent_cube and parent_cube[0] == "scans":
+            scans = list(parent_cube[1])
+        else:
+            idxs = self._encoding_scan_indices(enc)
+            scans = [self.scans[i] for i in idxs if 0 <= i < len(self.scans)]
+        keep = {}
+        for did in dim_ids:
+            if parse_dim_id(did)[0] == "scan":
+                continue
+            vals = self._average_keep_values(enc, did)
+            if vals is not None:
+                keep[did] = vals
+        return ("scans", self._average_scans_over_dims(scans, dim_ids, keep=keep))
+
+    def _average_output_view(self, source_enc, reduced_list, dim_ids, result_encoding=None):
+        """Catalog and encoding for an averaged measurement cube."""
+        collapsed = set(dim_ids or [])
+        rebuilt = self._dim_catalog_for_scans(reduced_list)
+        out_cat = []
+        for d in rebuilt:
+            if d["id"] in collapsed and parse_dim_id(d["id"])[0] != "axis":
+                continue
+            if parse_dim_id(d["id"])[0] == "axis" or d["id"] not in collapsed:
+                out_cat.append(d)
+        if isinstance(result_encoding, dict) and result_encoding.get("x_dim"):
+            return out_cat, copy.deepcopy(result_encoding)
+        x_dim = (source_enc or {}).get("x_dim") or "axis:0"
+        out_ids = {d["id"] for d in out_cat}
+        if x_dim not in out_ids or x_dim in collapsed:
+            axis_ids = [d["id"] for d in out_cat if str(d["id"]).startswith("axis:")]
+            x_dim = axis_ids[0] if axis_ids else (out_cat[0]["id"] if out_cat else "axis:0")
+        new_enc = default_encoding(x_dim=x_dim)
+        for d in out_cat:
+            if d["id"] == x_dim:
+                continue
+            if d["id"] == "scan" and len(reduced_list) > 1:
+                new_enc["dims"][d["id"]] = {"mode": DIM_MODE_ALL, "values": []}
+            else:
+                new_enc["dims"][d["id"]] = {
+                    "mode": DIM_MODE_ONE if d["id"] != "scan" else DIM_MODE_ALL,
+                    "values": [d["values"][0]] if d.get("values") else [],
+                }
+        return out_cat, new_enc
+
+    def _replay_average_recipe(self, rec):
+        """Rebuild an Average… plot. Older saves stored only the collapsed dim names."""
+        try:
+            cube = self._materialize_recipe(rec)
+        except Exception as exc:
+            logging.warning("Average recipe failed (%s): %s", rec.get("title"), exc)
+            return
+        if not cube or not cube[1]:
+            logging.warning("Average recipe produced nothing (%s)", rec.get("title"))
+            return
+        title = rec.get("title") or "Average"
+        kind_tag, payload = cube
+        if kind_tag == "scans":
+            src_enc = rec.get("source_encoding") or getattr(self.curves_dock.state, "encoding", None)
+            out_cat, new_enc = self._average_output_view(
+                src_enc, payload, rec.get("dims") or [], rec.get("result_encoding"),
+            )
+            out = self._open_universal_plotter(
+                title,
+                kind="derived_avg",
+                datasets=payload,
+                encoding=new_enc,
+                catalog=out_cat,
+            )
+        else:
+            new_enc = copy.deepcopy(rec.get("result_encoding") or default_encoding())
+            out = self._open_universal_plotter(
+                title,
+                kind="derived_fit",
+                encoding=new_enc,
+                derived_points=payload,
+            )
+        self._record_tab_recipe(rec, dock=out)
+        if isinstance(rec.get("style"), dict):
+            out.state.style.update(copy.deepcopy(rec["style"]))
+        out.state.xlabel = rec.get("xlabel") or ""
+        out.state.ylabel = rec.get("ylabel") or ""
+        if getattr(out, "style_panel", None) is not None:
+            out.style_panel.sync_from_state(out.state)
+        self._redraw_universal_dock(out)
+
     def _replay_derive_recipe(self, rec):
         """Rebuild a Fit-param plot from the saved source encoding."""
         src = copy.deepcopy(rec.get("source_encoding") or {})
@@ -10020,12 +10301,46 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not src or not fitfunc or not param or not new_x:
             logging.warning("Derive recipe is missing fit settings (%s)", rec.get("title"))
             return
-        points = self._compute_derive_points(src, fitfunc, param, new_x)
+        fit_scans = None
+        parent = rec.get("parent") if isinstance(rec.get("parent"), dict) else None
+        if parent is None and "roi" not in (src.get("dims") or {}):
+            # Saved before parent links: a fit on Avg: ROI stored only the
+            # averaged dock's encoding, which no longer has an ROI dim.
+            n_roi = 1
+            if self.scans and self.scans[0].data:
+                try:
+                    n_roi = len(self.scans[0].data[0])
+                except Exception:
+                    n_roi = 1
+            if n_roi > 1:
+                parent = {
+                    "type": "average",
+                    "dims": ["roi"],
+                    "source_encoding": copy.deepcopy(
+                        getattr(self.curves_dock.state, "encoding", None) or default_encoding()
+                    ),
+                }
+                rec["parent"] = parent
+        if parent is not None:
+            try:
+                cube = self._materialize_recipe(parent)
+            except Exception as exc:
+                logging.warning("Derive parent failed (%s): %s", rec.get("title"), exc)
+                cube = None
+            if cube and cube[0] == "scans":
+                fit_scans = cube[1]
+        points = self._compute_derive_points(src, fitfunc, param, new_x, scans=fit_scans)
         if not points:
             logging.warning("Derive recipe produced no points (%s)", rec.get("title"))
             return
         fit_along = rec.get("fit_along") or src.get("x_dim")
-        catalog = [d for d in self._cube_dim_catalog() if d["id"] != fit_along]
+        if fit_scans:
+            catalog = [
+                d for d in self._dim_catalog_for_scans(fit_scans)
+                if d["id"] != fit_along and d["id"] not in (rec.get("parent") or {}).get("dims", [])
+            ]
+        else:
+            catalog = [d for d in self._cube_dim_catalog() if d["id"] != fit_along]
         title = rec.get("title") or f"Derive: {param}"
         new_enc = default_encoding(x_dim=new_x, y_channel=f"fit:{param}")
         for d in catalog:
@@ -10103,7 +10418,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         elif rtype == "derive":
             self._replay_derive_recipe(rec)
         elif rtype == "average":
-            logging.info("Skipping average recipe restore (source cube is not in the zip): %s", rec.get("title"))
+            self._replay_average_recipe(rec)
         elif rtype in ("derived_merge", "derived_global"):
             logging.info("Skipping derived recipe restore (not portable without embedded data): %s", rtype)
         else:
