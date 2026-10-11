@@ -33,12 +33,14 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (
     QFont, QImage, QAction, QShortcut, QKeySequence, QPdfWriter, QPainter, QPageSize,
+    QPen,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QByteArray, QTimer, QSizeF, QSize, QRect
+from PyQt6.QtCore import Qt, pyqtSignal, QByteArray, QTimer, QSizeF, QSize, QRect, QRectF
 from pyqtgraph import (
     ErrorBarItem, mkPen, mkBrush, PlotWidget, ImageItem, ColorBarItem,
     GraphicsLayoutWidget, DateAxisItem, colormap as pg_colormap,
 )
+from pyqtgraph.graphicsItems.LegendItem import ItemSample
 
 import numpy as np
 from scipy.stats import sem
@@ -174,24 +176,34 @@ JOURNAL_PEN_STYLES = (
 )
 
 # Column widths are inches. DERIVED widths are not printed in the publisher
-# figure guide. lw_pt / fontsize_pt are the physical sizes at that width.
+# figure guide. Sizes below are the physical sizes at that width.
+# lw_pt is the data curve, axis_pt the frame and ticks, tick_pt the tick
+# length, marker_mm the symbol diameter.
 JOURNAL_SPECS = {
-    # APS Style Basics: 8.5 cm (3.375 in); lettering >= 2 mm → Times 9 pt.
-    # Curve linewidth >= 0.5 pt. 2-col is REVTeX text width (DERIVED).
+    # APS: lettering and symbol width >= 2 mm (Times 9 pt), curves >= 0.5 pt.
+    # Frame is heavier than the 0.5 pt floor so it reads as a box, still
+    # lighter than the curve. 2-col is REVTeX text width (DERIVED).
     "PRL": {
         "font": "Times New Roman",
         "fontsize_pt": 9,
-        "lw_pt": 0.5,
+        "lw_pt": 1.0,
+        "axis_pt": 0.75,
+        "tick_pt": 4.0,
+        "marker_mm": 2.2,
         "columns": {"1-col": 3.375, "2-col": 7.0},
         "bg": "#ffffff",
         "fg": "#000000",
     },
-    # Nature figure guide: 89 mm, 120–136 mm (130 used), 183 mm.
-    # Text 7 pt (allowed 5–7). Lines 0.75 pt (allowed 0.25–1).
+    # Nature: text 5–7 pt (7 used), strokes 0.25–1 pt. Their own sample
+    # line is 0.75 pt; the frame is a step lighter. Marker matches the
+    # cap height of 7 pt Arial (~1.8 mm).
     "Nature": {
         "font": "Arial",
         "fontsize_pt": 7,
         "lw_pt": 0.75,
+        "axis_pt": 0.5,
+        "tick_pt": 2.5,
+        "marker_mm": 1.8,
         "columns": {
             "1-col": 89 / 25.4,
             "1.5-col": 130 / 25.4,
@@ -200,13 +212,16 @@ JOURNAL_SPECS = {
         "bg": "#ffffff",
         "fg": "#000000",
     },
-    # Optics Letters length-check template: one column ~8.3 cm.
-    # Figure text 8 pt matches the OPG caption size. 2-col is DERIVED
-    # (2 × 8.3 cm + 0.5 cm gutter). Line width is not specified; 0.75 pt.
+    # OPG captions are 8 pt. Optics Letters one column is ~8.3 cm.
+    # 2-col is DERIVED (2 × 8.3 cm + 0.5 cm gutter). Stroke weights are
+    # not specified; same balance as PRL at the 8 pt size.
     "Optica": {
         "font": "Arial",
         "fontsize_pt": 8,
-        "lw_pt": 0.75,
+        "lw_pt": 1.0,
+        "axis_pt": 0.75,
+        "tick_pt": 3.5,
+        "marker_mm": 2.0,
         "columns": {"1-col": 8.3 / 2.54, "2-col": 17.1 / 2.54},
         "bg": "#ffffff",
         "fg": "#000000",
@@ -247,11 +262,37 @@ def journal_linewidth_value(style):
     return 2.0
 
 
+def journal_widget_px(plot_item):
+    """Visible width of the plot, in the same pixels the axis font is drawn in."""
+    if plot_item is None:
+        return 0.0
+    view = plot_item.getViewWidget() if hasattr(plot_item, "getViewWidget") else None
+    if view is not None and view.width() > 1:
+        return float(view.width())
+    return float(plot_item.width() or 0)
+
+
 def journal_paint_px(pt, widget_px, width_in):
     """Map a physical point size onto the widget so export scales back to pt."""
     if not width_in or widget_px <= 1:
         return None
     return max(1.0, float(pt) / 72.0 * float(widget_px) / float(width_in))
+
+
+def journal_curve_pen(color, style, widget_px, pen_style=None):
+    """Data / fit / error-bar pen. Journal widths are screen pixels (cosmetic)."""
+    style = style or default_plot_style()
+    _name, spec = journal_spec(style)
+    line_style = pen_style or Qt.PenStyle.SolidLine
+    if spec:
+        lw = journal_paint_px(spec["lw_pt"], widget_px, journal_column_width_in(style))
+        lw = 1.0 if lw is None else lw
+        return mkPen(color, width=lw, style=line_style, cosmetic=True)
+    return mkPen(
+        color,
+        width=float(style.get("linewidth", 2.0)),
+        style=line_style,
+    )
 
 # Curves display-X modes (cob_curves_x userData kind) — legacy bridge
 CURVES_X_AXIS = "axis"
@@ -312,23 +353,65 @@ def default_plot_style():
     }
 
 
+def marker_size_px(style, widget_px):
+    """On-screen marker diameter. Journal sizes are millimetres, App sizes are pixels."""
+    style = style or default_plot_style()
+    _name, spec = journal_spec(style)
+    if spec:
+        mm = style.get("marker_mm")
+        if mm is None:
+            mm = spec.get("marker_mm", 2.0)
+        px = journal_paint_px(float(mm) * 72.0 / 25.4, widget_px, journal_column_width_in(style))
+        return 6 if px is None else max(1, int(round(px)))
+    return max(1, int(style.get("symbol_size", 6)))
+
+
+class LegendSample(ItemSample):
+    """Legend swatch that stays inside its cell when the marker is large."""
+
+    def boundingRect(self):
+        side = max(float(self.width()), float(self.height()), 20.0)
+        return QRectF(0, 0, side, side)
+
+    def paint(self, p, *args):
+        from pyqtgraph import PlotDataItem
+        from pyqtgraph.graphicsItems.ScatterPlotItem import drawSymbol
+        side = max(float(self.boundingRect().width()), 20.0)
+        opts = self.item.opts
+        symbol = opts.get("symbol")
+        pen = opts.get("pen")
+        brush = opts.get("brush")
+        size = opts.get("size") or 8
+        if isinstance(self.item, PlotDataItem):
+            sopts = self.item.scatter.opts
+            symbol = sopts.get("symbol", symbol)
+            pen = sopts.get("pen", pen)
+            brush = sopts.get("brush", brush)
+            size = sopts.get("size", size)
+        scale = float(getattr(self.parentItem(), "_symbol_scale", 1.0) or 1.0)
+        p.setRenderHint(p.RenderHint.Antialiasing, True)
+        if symbol is None and pen is not None:
+            p.setPen(mkPen(pen))
+            p.drawLine(0, side / 2.0, side, side / 2.0)
+            return
+        if symbol is None:
+            return
+        p.save()
+        p.translate(side / 2.0, side / 2.0)
+        drawSymbol(
+            p, symbol, min(float(size) * scale, side * 0.65),
+            mkPen(pen), mkBrush(brush),
+        )
+        p.restore()
+
+
 def plot_kwargs_from_style(color, style=None, *, widget_px=0, symbol=None, pen_style=None):
     style = style or default_plot_style()
     mode = style.get("mode", "Scatter")
-    _name, spec = journal_spec(style)
-    if spec:
-        width_in = journal_column_width_in(style)
-        lw = journal_paint_px(spec["lw_pt"], widget_px, width_in)
-        lw = 1.0 if lw is None else lw
-        # 1 mm marker (PRL minimum) at the journal column width
-        ss = journal_paint_px(72.0 / 25.4, widget_px, width_in)
-        ss = 6 if ss is None else int(round(ss))
-    else:
-        lw = float(style.get("linewidth", 2.0))
-        ss = int(style.get("symbol_size", 6))
+    ss = marker_size_px(style, widget_px)
     pen = None
     if mode in ("Line", "Line+marker"):
-        pen = mkPen(color, width=lw, style=pen_style or Qt.PenStyle.SolidLine)
+        pen = journal_curve_pen(color, style, widget_px, pen_style)
     if mode == "Line":
         return {"pen": pen, "symbol": None}
     return {
@@ -1060,6 +1143,7 @@ class StylePanel(QWidget):
     column_changed = pyqtSignal(str)
     axis_labels_changed = pyqtSignal()
     colorbar_changed = pyqtSignal()
+    point_size_changed = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1077,6 +1161,11 @@ class StylePanel(QWidget):
         root.addWidget(self.chk_errorbars)
         root.addWidget(QLabel("Mode"))
         root.addWidget(self.cob_style)
+        root.addWidget(QLabel("Point size"))
+        self.sp_point = QDoubleSpinBox()
+        self.sp_point.setToolTip("Marker diameter. Millimetres for a journal, pixels for App.")
+        self.sp_point.setKeyboardTracking(False)
+        root.addWidget(self.sp_point)
         root.addWidget(QLabel("Journal"))
         self.cob_journal = QComboBox()
         self.cob_journal.addItems(JOURNAL_NAMES)
@@ -1115,6 +1204,7 @@ class StylePanel(QWidget):
         self.chk_legend.toggled.connect(self.legend_toggled.emit)
         self.chk_errorbars.toggled.connect(self.errorbars_toggled.emit)
         self.cob_style.currentTextChanged.connect(self.style_changed.emit)
+        self.sp_point.valueChanged.connect(self.point_size_changed.emit)
         self.cob_journal.currentTextChanged.connect(self._on_journal_changed)
         self.cob_column.currentTextChanged.connect(self.column_changed.emit)
         self.ed_xlabel.editingFinished.connect(self.axis_labels_changed.emit)
@@ -1123,12 +1213,31 @@ class StylePanel(QWidget):
         self.sp_cbar_min.valueChanged.connect(self._on_cbar_manual)
         self.sp_cbar_max.valueChanged.connect(self._on_cbar_manual)
         self._refill_columns("App")
+        self._sync_point_editor("App")
         self._sync_cbar_enabled()
 
     def _on_journal_changed(self, name):
         current = self.cob_column.currentText()
         self._refill_columns(name, current)
+        self._sync_point_editor(name)
         self.journal_changed.emit(name)
+
+    def _sync_point_editor(self, journal, value=None):
+        spec = JOURNAL_SPECS.get(journal)
+        self.sp_point.blockSignals(True)
+        if spec:
+            self.sp_point.setSuffix(" mm")
+            self.sp_point.setDecimals(1)
+            self.sp_point.setRange(0.4, 8.0)
+            self.sp_point.setSingleStep(0.1)
+            self.sp_point.setValue(float(spec["marker_mm"] if value is None else value))
+        else:
+            self.sp_point.setSuffix(" px")
+            self.sp_point.setDecimals(0)
+            self.sp_point.setRange(1, 48)
+            self.sp_point.setSingleStep(1)
+            self.sp_point.setValue(float(6 if value is None else value))
+        self.sp_point.blockSignals(False)
 
     def _refill_columns(self, journal, current=None):
         names = journal_column_names(journal)
@@ -1169,6 +1278,13 @@ class StylePanel(QWidget):
         self.chk_errorbars.setChecked(bool(state.show_errorbars))
         self.cob_style.setCurrentText(state.style.get("mode", "Scatter"))
         journal = state.style.get("journal") or "App"
+        if journal in JOURNAL_SPECS:
+            point = state.style.get("marker_mm")
+            if point is None:
+                point = JOURNAL_SPECS[journal]["marker_mm"]
+        else:
+            point = state.style.get("symbol_size", 6)
+        self._sync_point_editor(journal, point)
         if self.cob_journal.findText(journal) < 0:
             journal = "App"
         self.cob_journal.setCurrentText(journal)
@@ -2533,6 +2649,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
     def eventFilter(self, obj, event):
         if isinstance(obj, PlotDock):
             et = event.type()
+            if et == event.Type.Resize:
+                size = (obj.width(), obj.height())
+                if size != getattr(obj, "_journal_resize_seen", None) and size[0] > 1:
+                    obj._journal_resize_seen = size
+                    self._schedule_journal_rescale(obj)
             if et == event.Type.MouseButtonDblClick:
                 self.rename_dock(obj)
                 return True
@@ -2583,6 +2704,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         style.journal_changed.connect(lambda _n, d=dock: self._dock_apply_style_panel(d))
         style.column_changed.connect(lambda _n, d=dock: self._dock_apply_style_panel(d))
         style.axis_labels_changed.connect(lambda d=dock: self._dock_apply_style_panel(d))
+        style.point_size_changed.connect(lambda _v, d=dock: self._dock_apply_style_panel(d))
         style.colorbar_changed.connect(lambda d=dock: self._dock_set_colorbar(d))
 
         ana.cob_fit.clear()
@@ -2777,6 +2899,9 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self.set_focused_dock(dock)
         dock.state.show_legend = bool(checked)
         self._redraw_dock(dock)
+        # Legend add/remove changes the plot box after this redraw. Restyle
+        # once the layout has settled so fonts and strokes match that width.
+        self._schedule_journal_rescale(dock)
 
     def _dock_set_errorbars(self, dock, checked):
         self.set_focused_dock(dock)
@@ -2804,6 +2929,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             column = names[0]
         dock.state.style["column"] = column
         dock.state.style["linewidth"] = journal_linewidth_value(dock.state.style)
+        if journal in JOURNAL_SPECS:
+            dock.state.style["marker_mm"] = float(panel.sp_point.value())
+        else:
+            dock.state.style.pop("marker_mm", None)
+            dock.state.style["symbol_size"] = max(1, int(round(panel.sp_point.value())))
         dock.state.xlabel = panel.ed_xlabel.text().strip()
         dock.state.ylabel = panel.ed_ylabel.text().strip()
         self._redraw_dock(dock)
@@ -2906,9 +3036,32 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
     def _dock_copy_image(self, dock):
         self.set_focused_dock(dock)
-        widget = dock.widget() if dock else self.pw_plot
-        QApplication.clipboard().setPixmap(widget.grab())
-        self.statusBar().showMessage(f"Copied image: {dock.windowTitle()}", 2500)
+        self._copy_plot_image(dock)
+
+    def _copy_plot_image(self, dock):
+        """Copy the plot figure, the same image Save figure writes, not the side panel."""
+        widget = getattr(dock, "plot_widget", None) if dock is not None else None
+        if widget is None:
+            widget = self.pw_plot
+        if widget is None:
+            self.statusBar().showMessage("Copy image: no plot", 3000)
+            return
+        style = dock.state.style if dock is not None else default_plot_style()
+        px_w, _px_h, _width_in = self._figure_pixel_size(widget, style)
+        from pyqtgraph.exporters import ImageExporter
+        exp = ImageExporter(self._export_source(widget))
+        exp.parameters()["width"] = int(px_w)
+        undo = self._boost_export_strokes(widget, px_w)
+        try:
+            image = exp.export(toBytes=True)
+        finally:
+            self._restore_export_strokes(undo)
+        if image is None or image.isNull():
+            self.statusBar().showMessage("Copy image: export failed", 3000)
+            return
+        QApplication.clipboard().setImage(image)
+        title = dock.windowTitle() if dock is not None else "plot"
+        self.statusBar().showMessage(f"Copied image: {title}", 2500)
 
     def _dock_copy_raw(self, dock):
         """Copy this dock's curve data as TSV (Excel/Origin-friendly)."""
@@ -3111,7 +3264,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             pw.plot(
                 np.asarray(ov["x"], dtype=float),
                 np.asarray(ov["y"], dtype=float),
-                pen=mkPen(color, width=2),
+                pen=self._fit_pen(color, dock.state, pw.getPlotItem()),
             )
 
     def _record_tab_recipe(self, recipe, dock=None):
@@ -3251,6 +3404,34 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             return default_plot_style()
         return view_state.style or default_plot_style()
 
+    def _fit_pen(self, color, view_state, plot_item):
+        return journal_curve_pen(color, self._view_style(view_state), journal_widget_px(plot_item))
+
+    def _legend_kwargs(self, view_state, plot_item):
+        style = self._view_style(view_state)
+        _name, spec = journal_spec(style)
+        if spec is None:
+            return {}
+        width = journal_widget_px(plot_item)
+        width_in = journal_column_width_in(style)
+        px = journal_paint_px(spec["fontsize_pt"], width, width_in)
+        size = f"{int(spec['fontsize_pt'])}pt" if px is None else f"{max(6, int(round(px)))}px"
+        axis_px = journal_paint_px(spec["axis_pt"], width, width_in) or 1.0
+        return {
+            "labelTextSize": size,
+            "labelTextColor": spec["fg"],
+            "pen": mkPen(spec["fg"], width=axis_px, cosmetic=True),
+            "brush": mkBrush(255, 255, 255, 230),
+            "sampleType": LegendSample,
+        }
+
+    def _add_legend(self, host, view_state):
+        plot_item = host.getPlotItem() if hasattr(host, "getPlotItem") else host
+        kwargs = self._legend_kwargs(view_state, plot_item)
+        if hasattr(host, "addLegend"):
+            return host.addLegend(**kwargs)
+        return plot_item.addLegend(**kwargs)
+
     def _label_font(self, view_state=None, widget_px=0):
         style = self._view_style(view_state)
         _name, spec = journal_spec(style)
@@ -3277,19 +3458,19 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if hasattr(axis, "enableAutoSIPrefix"):
             # A typed label is shown as written. Automatic labels keep SI prefixes.
             axis.enableAutoSIPrefix(not custom)
-        width = plot_item.width() if hasattr(plot_item, "width") else 0
+        width = journal_widget_px(plot_item)
         plot_item.setLabel(side, text, units=None, **self._label_font(view_state, width))
 
     def _set_plot_title(self, plot_item, text, view_state=None):
         if plot_item is None:
             return
-        width = plot_item.width() if hasattr(plot_item, "width") else 0
+        width = journal_widget_px(plot_item)
         plot_item.setTitle(text or "", **self._label_font(view_state, width))
 
     def _style_plot_item(self, plot_item, view_state=None):
         style = self._view_style(view_state)
         _name, spec = journal_spec(style)
-        width = plot_item.width() if plot_item is not None and hasattr(plot_item, "width") else 0
+        width = journal_widget_px(plot_item)
         if spec is None:
             f = QFont("Segoe UI", 10)
             bg = THEME["bg"]
@@ -3305,11 +3486,39 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             bg = spec["bg"]
             fg = spec["fg"]
             grid = False
+        axis_px = None
+        tick_px = None
+        if spec is not None:
+            width_in = journal_column_width_in(style)
+            axis_px = journal_paint_px(spec["axis_pt"], width, width_in)
+            tick_px = journal_paint_px(spec["tick_pt"], width, width_in)
         for axis_name in ("left", "bottom", "top", "right"):
             axis = plot_item.getAxis(axis_name)
-            axis.setStyle(tickFont=f)
+            style_kw = {"tickFont": f}
+            if spec is None:
+                style_kw["maxTickLevel"] = 2
+            else:
+                # Major ticks only, pointing into the axes box.
+                style_kw["maxTickLevel"] = 0
+            if tick_px is not None:
+                style_kw["tickLength"] = -max(1, int(round(tick_px)))
+                if px is not None:
+                    style_kw["tickTextOffset"] = max(2, int(round(float(px) * 0.22)))
+            axis.setStyle(**style_kw)
             try:
-                axis.setPen(fg)
+                if spec is None:
+                    axis.setPen(fg)
+                    axis.setTickPen()
+                else:
+                    # Non-cosmetic so the frame scales with the axis picture on export.
+                    # Flat caps keep the stroke from poking through the spine.
+                    w = 1.0 if axis_px is None else axis_px
+                    frame = mkPen(fg, width=w, cosmetic=False)
+                    frame.setCapStyle(Qt.PenCapStyle.FlatCap)
+                    axis.setPen(frame)
+                    ticks = QPen(frame)
+                    ticks.setCapStyle(Qt.PenCapStyle.FlatCap)
+                    axis.setTickPen(ticks)
                 axis.setTextPen(fg)
             except Exception:
                 pass
@@ -3323,6 +3532,85 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             plot_item.getViewBox().setBackgroundColor(bg)
         except Exception:
             pass
+
+    def _schedule_journal_rescale(self, dock):
+        """Queue a font/stroke update after the dock's size has settled."""
+        if dock is None or journal_spec(self._view_style(getattr(dock, "state", None)))[1] is None:
+            return False
+        pending = getattr(self, "_journal_rescale_docks", None)
+        if pending is None:
+            pending = set()
+            self._journal_rescale_docks = pending
+        pending.add(dock)
+        timer = getattr(self, "_journal_rescale_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._run_journal_rescale)
+            self._journal_rescale_timer = timer
+        timer.start(80)
+        return True
+
+    def _run_journal_rescale(self):
+        docks = list(getattr(self, "_journal_rescale_docks", ()) or ())
+        self._journal_rescale_docks = set()
+        for dock in docks:
+            if dock is self.curves_dock or dock in self.plot_docks:
+                self._rescale_journal_view(dock)
+
+    def _rescale_journal_view(self, dock):
+        """Recompute journal fonts, frame, ticks, and point size for the current width."""
+        widget = getattr(dock, "plot_widget", None)
+        if widget is None and dock is self.curves_dock:
+            widget = self.pw_plot
+        if widget is None:
+            return
+        view_state = dock.state
+        style = self._view_style(view_state)
+        _name, spec = journal_spec(style)
+        if spec is None:
+            return
+        items = []
+        if hasattr(widget, "getPlotItem"):
+            items = [widget.getPlotItem()]
+        else:
+            scene = widget.scene() if hasattr(widget, "scene") else None
+            if scene is not None:
+                from pyqtgraph import PlotItem
+                items = [it for it in scene.items() if isinstance(it, PlotItem)]
+        for plot_item in items:
+            self._style_plot_item(plot_item, view_state)
+            width = journal_widget_px(plot_item)
+            for side in ("bottom", "left"):
+                try:
+                    current = plot_item.getAxis(side).label.toPlainText()
+                except Exception:
+                    current = ""
+                if current and current.strip():
+                    self._set_plot_label(plot_item, side, current, view_state)
+            ss = marker_size_px(style, width)
+            from pyqtgraph import PlotDataItem, ErrorBarItem, LegendItem
+            for item in list(plot_item.items):
+                if isinstance(item, PlotDataItem):
+                    if item.opts.get("symbol") is not None and ss is not None:
+                        item.setSymbolSize(max(1, int(round(ss))))
+                    pen = item.opts.get("pen")
+                    if isinstance(pen, QPen) and pen.style() != Qt.PenStyle.NoPen:
+                        item.setPen(journal_curve_pen(pen.color(), style, width, pen.style()))
+                elif isinstance(item, ErrorBarItem):
+                    pen = item.opts.get("pen")
+                    if isinstance(pen, QPen):
+                        item.setOpts(pen=journal_curve_pen(pen.color(), style, width, pen.style()))
+            legend = getattr(plot_item, "legend", None)
+            if isinstance(legend, LegendItem):
+                px = journal_paint_px(spec["fontsize_pt"], width, journal_column_width_in(style))
+                if px is not None:
+                    size = f"{max(6, int(round(px)))}px"
+                    for _sample, label in list(legend.items):
+                        label.setText(label.text, size=size)
+                axis_px = journal_paint_px(spec["axis_pt"], width, journal_column_width_in(style)) or 1.0
+                legend.opts["pen"] = mkPen(spec["fg"], width=axis_px, cosmetic=True)
+                legend.update()
 
     def _prepare_plot_widget(self, plot_widget, view_state=None):
         if plot_widget is None:
@@ -3377,7 +3665,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         symbol = style.get("symbol") if isinstance(style, dict) else None
         pen_style = style.get("penStyle") if isinstance(style, dict) else None
         plot_kw = plot_kwargs_from_style(
-            color, view_style, widget_px=plot_item.width(),
+            color, view_style, widget_px=journal_widget_px(plot_item),
             symbol=symbol, pen_style=pen_style,
         )
         if style and style.get("symbolBrush") and plot_kw.get("symbol"):
@@ -3387,8 +3675,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         idx = np.isfinite(heights) & (heights > 0)
         if show_errorbars and np.any(idx):
             beam = 0.007 * (unique_x.max() - unique_x.min()) if len(unique_x) else 0.01
+            err_pen = plot_kw.get("pen")
+            if err_pen is None:
+                err_pen = journal_curve_pen(color, view_style, journal_widget_px(plot_item))
             err_item = ErrorBarItem(
-                x=unique_x[idx], y=y_centers[idx], height=heights[idx], beam=beam
+                x=unique_x[idx], y=y_centers[idx], height=heights[idx],
+                beam=beam, pen=err_pen,
             )
             plot_item.addItem(err_item)
         if name:
@@ -3469,10 +3761,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.two_d_plot()
 
     def copy_plot_image(self):
-        dock = self.focused_plot_dock()
-        widget = dock.widget() if dock else self.pw_plot
-        screenshot = widget.grab()
-        QApplication.clipboard().setPixmap(screenshot)
+        self._copy_plot_image(self.focused_plot_dock())
 
     def copy_raw_data(self):
         """Ctrl+A — copy raw data from the focused plot dock."""
@@ -4557,7 +4846,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         show_legend = bool(vst.show_legend)
         if show_legend:
-            self.pw_plot.addLegend()
+            self._add_legend(self.pw_plot, vst)
 
         n_scans = len({id(s) for s, _, _, _ in series})
         n_rois = len({r for _, r, _, _ in series})
@@ -4581,15 +4870,18 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
     def _draw_axis_fits(self, series, n_scans):
         summaries = []
-        for scan, roi, slice_index, _extra in series:
+        vst = self._curves_view_state()
+        for color_i, (scan, roi, slice_index, _extra) in enumerate(series):
             fit, params, popt, perr = scan.plots.get_fit(slice_index, roi)
             if fit:
+                color = self._series_style(color_i, vst)["symbolBrush"]
+                pen = self._fit_pen(color, vst, self.pw_plot.getPlotItem())
                 try:
+                    fit.setPen(pen)
                     self.pw_plot.addItem(fit)
                 except Exception:
                     fx, fy = fit.getData()
-                    color = OVERLAY_COLORS[0]
-                    self.pw_plot.plot(fx, fy, pen=mkPen(color, width=2))
+                    self.pw_plot.plot(fx, fy, pen=pen)
                 if params is not None and popt is not None:
                     short = ", ".join(
                         f"{p}={self.format_fit_params(v, e)}"
@@ -4619,7 +4911,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             return
         show_legend = bool(vst.show_legend)
         if show_legend:
-            self.pw_plot.addLegend()
+            self._add_legend(self.pw_plot, vst)
         primary = self.primary_scan()
         if primary is not None:
             self._set_plot_label(
@@ -4704,7 +4996,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             times = [float(i) for i in range(len(scan_idxs))]
             self._set_plot_label(self.pw_plot.getPlotItem(), "bottom", "scan index", vst)
         if show_legend:
-            self.pw_plot.addLegend()
+            self._add_legend(self.pw_plot, vst)
 
         # Expand curve-axis picks from first scan (shared detuning grid)
         probe = self.scans[scan_idxs[0]]
@@ -5124,8 +5416,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     xf, yf, popt, perr = self.fitter.perform_fit(
                         x, y, func, errors, guess, fixed
                     )
-                    color = OVERLAY_COLORS[color_i % len(OVERLAY_COLORS)]
-                    fit = self.pw_plot.plot(xf, yf, pen=mkPen(color, width=2))
+                    color = self._series_style(color_i, self._curves_view_state())["symbolBrush"]
+                    fit = self.pw_plot.plot(
+                        xf, yf,
+                        pen=self._fit_pen(color, self._curves_view_state(), self.pw_plot.getPlotItem()),
+                    )
                     scan.plots.add_fit(slice_index, roi, fit, params, popt, perr)
                     n_ok += 1
                 except Exception as exc:
@@ -5163,8 +5458,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             try:
                 x, y, errors = self._series_xy_for_fit(scan, slice_index, roi)
                 xf, yf, popt, perr = self.fitter.perform_fit(x, y, func, errors, guess, fixed)
-                color = OVERLAY_COLORS[roi % len(OVERLAY_COLORS)]
-                fit = pw.plot(xf, yf, pen=mkPen(color, width=2))
+                color = self._series_style(roi, dock.state)["symbolBrush"]
+                fit = pw.plot(xf, yf, pen=self._fit_pen(color, dock.state, pw.getPlotItem()))
                 scan.plots.add_fit(slice_index, roi, fit, params, popt, perr)
                 n_ok += 1
             except Exception as exc:
@@ -6708,6 +7003,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         style.journal_changed.connect(lambda _n, d=dock: self._dock_apply_style_panel(d))
         style.column_changed.connect(lambda _n, d=dock: self._dock_apply_style_panel(d))
         style.axis_labels_changed.connect(lambda d=dock: self._dock_apply_style_panel(d))
+        style.point_size_changed.connect(lambda _v, d=dock: self._dock_apply_style_panel(d))
         style.colorbar_changed.connect(lambda d=dock: self._dock_set_colorbar(d))
         ana.cob_fit.clear()
         ana.cob_fit.addItems(list(self.fitter.func_dict.keys()))
@@ -6921,6 +7217,60 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             out.append(base)
         return out
 
+    def _derived_fit_series_key(self, p, x_dim, axis_ids):
+        """Identity of a fit-param point aside from the plotted X axis."""
+        parts = []
+        if x_dim != "roi":
+            try:
+                parts.append(("roi", int(p.get("roi", -1))))
+            except (TypeError, ValueError):
+                parts.append(("roi", -1))
+        if x_dim != "scan":
+            try:
+                parts.append(("scan", int(p.get("scan_i", -1))))
+            except (TypeError, ValueError):
+                parts.append(("scan", -1))
+        av = p.get("axis_vals") or {}
+        for aid in axis_ids:
+            val = av.get(aid)
+            try:
+                val = round(float(val), 9)
+            except (TypeError, ValueError):
+                pass
+            parts.append((aid, val))
+        return tuple(parts)
+
+    def _derived_fit_legend_name(self, key, varying, dock):
+        """Legend text for one fit-param series. Only dims that differ are listed."""
+        if not key:
+            return None
+        use = [key[i] for i in varying] if varying else [
+            bit for bit in key if bit[0] == "roi"
+        ]
+        if not use:
+            use = list(key[:1])
+        panel = getattr(dock, "encoding_panel", None)
+        cat = {
+            d.get("id"): d.get("label")
+            for d in (getattr(panel, "_dim_catalog", None) or [])
+        }
+        bits = []
+        for kind, val in use:
+            if kind == "roi":
+                bits.append(f"ROI {int(val)}")
+            elif kind == "scan":
+                try:
+                    bits.append(self._scan_short_name(self.scans[int(val)]))
+                except Exception:
+                    bits.append(f"scan {val}")
+            else:
+                label = cat.get(kind) or kind
+                if isinstance(val, float):
+                    bits.append(f"{label}={val:g}")
+                else:
+                    bits.append(f"{label}={val}")
+        return ", ".join(bits) if bits else None
+
     def _derived_point_x(self, p, x_dim):
         """X coordinate of a derive point for the requested encoding X dim."""
         kind, _ = parse_dim_id(x_dim or "")
@@ -7097,9 +7447,11 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
 
         if ych != Y_CHANNEL_MEASUREMENT and dock.state.derived_points:
             pw.clear()
+            self._active_view_state = dock.state
+            self._prepare_plot_widget(pw, dock.state)
             dock.state.series_items = []
             if dock.state.show_legend:
-                pw.addLegend()
+                self._add_legend(pw, dock.state)
             pts = list(dock.state.derived_points)
             dims = enc.get("dims") or {}
             x_dim = enc.get("x_dim") or ""
@@ -7121,38 +7473,64 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     want = {int(v) for v in scan_st["values"]}
                     pts = [p for p in pts if int(p.get("scan_i", -1)) in want]
 
-            xs, ys, yerr = [], [], []
+            axis_ids = sorted({
+                aid
+                for p in pts
+                for aid in (p.get("axis_vals") or {})
+                if aid != x_dim
+            })
+            groups = {}
             for p in pts:
                 xv = self._derived_point_x(p, x_dim)
                 if not np.isfinite(xv):
                     continue
-                xs.append(xv)
-                ys.append(float(p["y"]))
-                yerr.append(float(p.get("yerr", 0.0) or 0.0))
-            xs = np.asarray(xs, dtype=float)
-            ys = np.asarray(ys, dtype=float)
-            yerr = np.asarray(yerr, dtype=float)
-            if len(xs):
-                order = np.argsort(xs)
-                xs, ys, yerr = xs[order], ys[order], yerr[order]
+                key = self._derived_fit_series_key(p, x_dim, axis_ids)
+                bucket = groups.get(key)
+                if bucket is None:
+                    bucket = [[], [], []]
+                    groups[key] = bucket
+                bucket[0].append(xv)
+                bucket[1].append(float(p["y"]))
+                bucket[2].append(float(p.get("yerr", 0.0) or 0.0))
+            order_keys = sorted(groups, key=lambda k: tuple(
+                (0, v) if isinstance(v, (int, float)) else (1, str(v))
+                for _kind, v in k
+            ))
+            varying = []
+            if len(order_keys) > 1 and order_keys[0]:
+                for i in range(len(order_keys[0])):
+                    if len({k[i][1] for k in order_keys}) > 1:
+                        varying.append(i)
             # Prefer dock catalog labels (fit-along already removed)
             panel = getattr(dock, "encoding_panel", None)
             cat = list(getattr(panel, "_dim_catalog", None) or self._cube_dim_catalog())
             label = next((d["label"] for d in cat if d["id"] == x_dim), x_dim)
-            pw.setLabel("bottom", label, **font)
             ylab = ych[4:] if ych.startswith("fit:") else ych
-            pw.setLabel("left", ylab, **font)
-            if len(xs):
-                self._add_errorbar_scatter(
-                    pw.getPlotItem(),
-                    xs, ys, yerr * 2,
-                    y_centers=ys,
-                    style=self._series_style(0),
-                    name=ylab if dock.state.show_legend else None,
-                    view_style=dock.state.style,
-                    show_errorbars=dock.state.show_errorbars,
-                    series_out=dock.state.series_items,
-                )
+            self._set_plot_label(pw.getPlotItem(), "bottom", label, dock.state)
+            self._set_plot_label(pw.getPlotItem(), "left", ylab, dock.state)
+            if order_keys:
+                with self._batch_plot_items(pw):
+                    for color_i, key in enumerate(order_keys):
+                        gxs, gys, gyerr = groups[key]
+                        gxs = np.asarray(gxs, dtype=float)
+                        gys = np.asarray(gys, dtype=float)
+                        gyerr = np.asarray(gyerr, dtype=float)
+                        ord_i = np.argsort(gxs, kind="mergesort")
+                        gxs, gys, gyerr = gxs[ord_i], gys[ord_i], gyerr[ord_i]
+                        name = None
+                        if dock.state.show_legend:
+                            name = self._derived_fit_legend_name(key, varying, dock)
+                        style = self._series_style(color_i, dock.state)
+                        self._add_errorbar_scatter(
+                            pw.getPlotItem(),
+                            gxs, gys, gyerr * 2,
+                            y_centers=gys,
+                            style=style,
+                            name=name,
+                            view_style=dock.state.style,
+                            show_errorbars=dock.state.show_errorbars,
+                            series_out=dock.state.series_items,
+                        )
             return
 
         if dock.state.derived_scan is not None:
@@ -7751,31 +8129,145 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         else:
             raise ValueError(f"Unsupported figure type '{ext}'. Use png, tif, svg, or pdf.")
 
+    def _place_legend_for_export(self, legend, scale):
+        """Keep a corner-anchored legend in that corner on the exported figure.
+
+        The legend ignores the export scale, but its position does not. Anchoring
+        with the boosted size pulls a bottom or right corner inward.
+        """
+        parent = legend.parentItem()
+        if parent is None or scale <= 1.0:
+            return
+        item_anchor = getattr(legend, "_GraphicsWidgetAnchor__itemAnchor", None)
+        parent_anchor = getattr(legend, "_GraphicsWidgetAnchor__parentAnchor", None)
+        offset = getattr(legend, "_GraphicsWidgetAnchor__offset", (0, 0))
+        if not item_anchor or not parent_anchor:
+            return
+        # anchor() subtracts the full legend size. The export scales the position
+        # and not the legend, so only size/scale belongs in that subtraction.
+        extra_x = float(item_anchor[0]) * float(legend.width()) * (1.0 - 1.0 / scale)
+        extra_y = float(item_anchor[1]) * float(legend.height()) * (1.0 - 1.0 / scale)
+        legend.anchor(
+            item_anchor,
+            parent_anchor,
+            (float(offset[0]) + extra_x, float(offset[1]) + extra_y),
+        )
+        return (item_anchor, parent_anchor, offset)
+
+    def _boost_export_strokes(self, widget, px_w):
+        """Image export scales pictures and markers, but not cosmetic pens.
+
+        Axis frames are non-cosmetic and already scale. Curves, error bars,
+        and the legend (it ignores transforms) need an explicit boost.
+        """
+        scale = float(px_w) / max(float(widget.width()), 1.0)
+        undo = []
+        if scale <= 1.05:
+            return undo
+        scene = widget.scene() if hasattr(widget, "scene") else None
+        if scene is None:
+            return undo
+        from pyqtgraph import PlotDataItem, ErrorBarItem, LegendItem
+        for item in scene.items():
+            if isinstance(item, PlotDataItem):
+                pen = item.opts.get("pen")
+                if isinstance(pen, QPen) and pen.isCosmetic() and pen.widthF() > 0:
+                    old = QPen(pen)
+                    boosted = QPen(pen)
+                    boosted.setWidthF(pen.widthF() * scale)
+                    item.setPen(boosted)
+                    undo.append(lambda it=item, prev=old: it.setPen(prev))
+            elif isinstance(item, ErrorBarItem):
+                pen = item.opts.get("pen")
+                if isinstance(pen, QPen) and pen.isCosmetic() and pen.widthF() > 0:
+                    old = QPen(pen)
+                    boosted = QPen(pen)
+                    boosted.setWidthF(pen.widthF() * scale)
+                    item.setOpts(pen=boosted)
+                    undo.append(lambda it=item, prev=old: it.setOpts(pen=prev))
+            elif isinstance(item, LegendItem):
+                undo.append(lambda it=item: it.updateSize())
+                item._symbol_scale = scale
+                undo.append(lambda it=item: setattr(it, "_symbol_scale", 1.0))
+                for sample, label in list(item.items):
+                    old_size = label.opts.get("size")
+                    if isinstance(old_size, str) and old_size.endswith("px"):
+                        n = max(1, int(round(float(old_size[:-2]) * scale)))
+                        label.setText(label.text, size=f"{n}px")
+                        label.setGeometry(0, 0, label.minimumWidth(), label.minimumHeight())
+                        undo.append(lambda lab=label, prev=old_size: (
+                            lab.setText(lab.text, size=prev),
+                            lab.setGeometry(0, 0, lab.minimumWidth(), lab.minimumHeight()),
+                        ))
+                    side = max(float(label.minimumHeight()), 20.0)
+                    prev_sample = (
+                        sample.minimumWidth(), sample.maximumWidth(),
+                        sample.minimumHeight(), sample.maximumHeight(),
+                    )
+                    sample.setMinimumWidth(side)
+                    sample.setMaximumWidth(side)
+                    sample.setMinimumHeight(side)
+                    sample.setMaximumHeight(side)
+                    undo.append(lambda s=sample, prev=prev_sample: (
+                        s.setMinimumWidth(prev[0]), s.setMaximumWidth(prev[1]),
+                        s.setMinimumHeight(prev[2]), s.setMaximumHeight(prev[3]),
+                        s.setGeometry(0, 0, prev[1], prev[3]),
+                    ))
+                if hasattr(item.layout, "invalidate"):
+                    item.layout.invalidate()
+                if hasattr(item.layout, "activate"):
+                    item.layout.activate()
+                item.updateSize()
+                saved_anchor = self._place_legend_for_export(item, scale)
+                if saved_anchor is not None:
+                    undo.append(lambda it=item, saved=saved_anchor: it.anchor(*saved))
+                pen = item.opts.get("pen")
+                if isinstance(pen, QPen) and pen.widthF() > 0:
+                    old = QPen(pen)
+                    boosted = QPen(pen)
+                    boosted.setWidthF(max(pen.widthF(), 0.5) * scale)
+                    item.opts["pen"] = boosted
+                    item.update()
+                    undo.append(lambda it=item, prev=old: (it.opts.__setitem__("pen", prev), it.update()))
+        return undo
+
+    def _restore_export_strokes(self, undo):
+        for action in reversed(undo):
+            action()
+
     def _write_raster(self, widget, path, px_w, png=True):
         from pyqtgraph.exporters import ImageExporter
         exp = ImageExporter(self._export_source(widget))
         exp.parameters()["width"] = int(px_w)
-        if png:
-            exp.export(path)
-            return
-        import os
-        fd, tmp_name = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
-        tmp = Path(tmp_name)
+        undo = self._boost_export_strokes(widget, px_w)
         try:
-            exp.export(str(tmp))
-            with Image.open(tmp) as im:
-                im.save(path, format="TIFF", compression="tiff_lzw")
+            if png:
+                exp.export(path)
+                return
+            import os
+            fd, tmp_name = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            tmp = Path(tmp_name)
+            try:
+                exp.export(str(tmp))
+                with Image.open(tmp) as im:
+                    im.save(path, format="TIFF", compression="tiff_lzw")
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
         finally:
-            if tmp.exists():
-                tmp.unlink()
+            self._restore_export_strokes(undo)
 
     def _write_svg(self, widget, path, px_w):
         try:
             from pyqtgraph.exporters import SVGExporter
             exp = SVGExporter(self._export_source(widget))
             exp.parameters()["width"] = int(px_w)
-            exp.export(path)
+            undo = self._boost_export_strokes(widget, px_w)
+            try:
+                exp.export(path)
+            finally:
+                self._restore_export_strokes(undo)
             return
         except Exception as exc:
             logging.warning("pyqtgraph SVG export failed (%s); writing with Qt", exc)
@@ -7790,6 +8282,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not painter.isActive():
             raise RuntimeError(f"Could not open {path} for SVG output")
         try:
+            painter.scale(px_w / max(widget.width(), 1), px_h / max(widget.height(), 1))
             widget.render(painter)
         finally:
             painter.end()
@@ -7808,6 +8301,12 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if not painter.isActive():
             raise RuntimeError(f"Could not open {path} for PDF output")
         try:
+            page = painter.viewport()
+            if widget.width() > 1 and page.width() > 1:
+                painter.scale(
+                    page.width() / float(widget.width()),
+                    page.height() / float(max(widget.height(), 1)),
+                )
             widget.render(painter)
         finally:
             painter.end()
@@ -8003,7 +8502,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         dock.state.series_items = []
         show_legend = dock.state.show_legend
         if show_legend:
-            pw.addLegend()
+            self._add_legend(pw, dock.state)
         self._set_plot_label(
             pw.getPlotItem(), "left", probe.metadata.get("function", ""), dock.state
         )
@@ -8149,10 +8648,8 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                         except Exception:
                             try:
                                 fx, fy = fit.getData()
-                                pw.plot(
-                                    fx, fy,
-                                    pen=mkPen(OVERLAY_COLORS[color_i % len(OVERLAY_COLORS)], width=2),
-                                )
+                                color = self._series_style(color_i, dock.state)["symbolBrush"]
+                                pw.plot(fx, fy, pen=self._fit_pen(color, dock.state, pw.getPlotItem()))
                             except Exception:
                                 pass
                     color_i += 1
@@ -8170,7 +8667,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         self._prepare_plot_widget(pw, dock.state)
         dock.state.series_items = []
         if dock.state.show_legend:
-            pw.addLegend()
+            self._add_legend(pw, dock.state)
         rec = dock.state.recipe if isinstance(dock.state.recipe, dict) else {}
         self._set_plot_label(
             pw.getPlotItem(), "bottom", rec.get("auto_xlabel") or "x", dock.state
@@ -8206,7 +8703,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             plot_item.clear()
             self._style_plot_item(plot_item, dock.state)
             if dock.state.show_legend and plot_item is first_plot:
-                plot_item.addLegend()
+                self._add_legend(plot_item, dock.state)
             for color_i, panel in enumerate(group):
                 xs = np.asarray(panel["x"], dtype=float)
                 ys = np.asarray(panel["y"], dtype=float)
@@ -8224,7 +8721,7 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
                     plot_item.plot(
                         np.asarray(panel["fit_x"], dtype=float),
                         np.asarray(panel["fit_y"], dtype=float),
-                        pen=mkPen(OVERLAY_COLORS[1], width=2),
+                        pen=self._fit_pen(OVERLAY_COLORS[1], dock.state, plot_item),
                     )
 
     def batch_fit_selected(self, recipe=None, dock=None):
@@ -8654,6 +9151,47 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
         if matches:
             self.list_experiments.setCurrentItem(matches[0])
 
+    def _replay_derive_recipe(self, rec):
+        """Rebuild a Fit-param plot from the saved source encoding."""
+        src = copy.deepcopy(rec.get("source_encoding") or {})
+        fitfunc = rec.get("fitfunc")
+        param = rec.get("param")
+        new_x = rec.get("x_dim")
+        if not src or not fitfunc or not param or not new_x:
+            logging.warning("Derive recipe is missing fit settings (%s)", rec.get("title"))
+            return
+        points = self._compute_derive_points(src, fitfunc, param, new_x)
+        if not points:
+            logging.warning("Derive recipe produced no points (%s)", rec.get("title"))
+            return
+        fit_along = rec.get("fit_along") or src.get("x_dim")
+        catalog = [d for d in self._cube_dim_catalog() if d["id"] != fit_along]
+        title = rec.get("title") or f"Derive: {param}"
+        new_enc = default_encoding(x_dim=new_x, y_channel=f"fit:{param}")
+        for d in catalog:
+            if d["id"] == new_x:
+                continue
+            new_enc["dims"][d["id"]] = {
+                "mode": DIM_MODE_ALL if d["id"] in ("scan", "roi") else DIM_MODE_ONE,
+                "values": [d["values"][0]] if d.get("values") else [],
+            }
+        out = self._open_universal_plotter(
+            title,
+            kind="derived_fit",
+            encoding=new_enc,
+            derived_points=points,
+            fitfunc=fitfunc,
+            catalog=catalog,
+        )
+        if isinstance(rec.get("style"), dict):
+            out.state.style.update(copy.deepcopy(rec["style"]))
+        out.state.xlabel = rec.get("xlabel") or ""
+        out.state.ylabel = rec.get("ylabel") or ""
+        self._record_tab_recipe(rec, dock=out)
+        if getattr(out, "style_panel", None) is not None:
+            out.style_panel.sync_from_state(out.state)
+        self._redraw_universal_dock(out)
+
     def _replay_tab_recipe(self, rec, restore_ui_context=True):
         """Replay an analysis recipe.
 
@@ -8691,6 +9229,10 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             self.generate_heatmap(recipe=rec)
         elif rtype == "batch":
             self.batch_fit_selected(recipe=rec)
+        elif rtype == "derive":
+            self._replay_derive_recipe(rec)
+        elif rtype == "average":
+            logging.info("Skipping average recipe restore (source cube is not in the zip): %s", rec.get("title"))
         elif rtype in ("derived_merge", "derived_global"):
             logging.info("Skipping derived recipe restore (not portable without embedded data): %s", rtype)
         else:

@@ -885,9 +885,19 @@ def main():
             raise AssertionError(optica)
         if sp.journal_column_width_in({"journal": "App"}) is not None:
             raise AssertionError("App style has no physical width")
-        if sp.JOURNAL_SPECS["PRL"]["fontsize_pt"] != 9:
+        prl_spec = sp.JOURNAL_SPECS["PRL"]
+        if prl_spec["fontsize_pt"] != 9:
             raise AssertionError("PRL lettering must be 9 pt to clear 2 mm")
-        if "1.5-col" not in sp.JOURNAL_SPECS["Nature"]["columns"]:
+        if prl_spec["marker_mm"] < 2.0:
+            raise AssertionError("PRL symbol width must be at least 2 mm")
+        if prl_spec["lw_pt"] < 0.5 or prl_spec["axis_pt"] < 0.5:
+            raise AssertionError("PRL strokes must stay at or above 0.5 pt")
+        nature_spec = sp.JOURNAL_SPECS["Nature"]
+        if nature_spec["fontsize_pt"] > 7 or nature_spec["lw_pt"] > 1 or nature_spec["axis_pt"] > 1:
+            raise AssertionError("Nature text or stroke is outside the published range")
+        if nature_spec["lw_pt"] < 0.25 or nature_spec["axis_pt"] < 0.25:
+            raise AssertionError("Nature strokes must stay at or above 0.25 pt")
+        if "1.5-col" not in nature_spec["columns"]:
             raise AssertionError("Nature is missing the 1.5 column width")
 
     run("journal_widths", t_journal_widths)

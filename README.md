@@ -96,7 +96,7 @@ Mental model: **Loaded scans is the current experiment.** If nothing has been sa
 
 1. **Encoding**: Type (`XY` | `2D` | `ROI grid`) / axes / Dimensions
 2. **Derive**: Fit param… / Average… (new data → new plot)
-3. **Style**: Legend, Error bars, Mode, Journal, Column, X/Y labels
+3. **Style**: Legend, Error bars, Mode, Point size, Journal, Column, X/Y labels
 4. **Analyze**: Fit / Clear fit / Refresh / Export / Copy / Clear data…
 
 ```
@@ -131,7 +131,7 @@ Each dock’s Encoding sidebar stores `encoding_panel._dim_catalog`.
 
 | Action | Effect |
 |--------|--------|
-| **Fit param…** | Fit along current X (any Analyze model) → Y = one fit param → new `derived_fit` plot. Fit-along dim is dropped from Dimensions. |
+| **Fit param…** | Fit along current X (any Analyze model) → Y = one fit param → new `derived_fit` plot. Fit-along dim is dropped from Dimensions. Points that differ on a non-X dim (usually ROI) are separate series: legend `ROI 7`, Wong color, and a distinct marker. The Y name stays on the axis, not in the legend. |
 | **Average…** | Multi-select dims → mean collapse → new plot. Works on **measurement cubes** (`derived_avg`) and on **Fit-param point plots** (average over ROI / scan / remaining axes; stays `derived_fit`). |
 
 Nested Average (e.g. ROI then scan) keeps only dims still present on the source catalog; axes come from the reduced cube’s `key_sets`.
@@ -149,7 +149,7 @@ Nested Average (e.g. ROI then scan) keeps only dims still present on the source 
 | Field | Role |
 |-------|------|
 | `kind` | `curves` \| `derived_fit` \| `derived_avg` \| `export` \| `2d` \| `heatmap` \| `batch` |
-| `style` | `mode`, `journal` (`App`/`PRL`/`Nature`/`Optica`), `column`, `linewidth` |
+| `style` | `mode`, `journal` (`App`/`PRL`/`Nature`/`Optica`), `column`, `linewidth`. Optional `marker_mm` (journal) or `symbol_size` (App px) |
 | `show_legend` / `show_errorbars` | View toggles |
 | `xlabel` / `ylabel` | Blank = automatic axis title. Non-blank disables pyqtgraph SI prefix on that axis |
 | `fitfunc` | Per-dock fit function name |
@@ -220,15 +220,15 @@ Import picker: `ScanPickerDialog` with filter + sort (Name/Date).
 
 ### Style / axis labels
 
-`StylePanel` (and the export/2D control bar) writes `style["journal"]`, `style["column"]`, `xlabel`, `ylabel`.
+`StylePanel` (and the export/2D control bar) writes `style["journal"]`, `style["column"]`, `xlabel`, `ylabel`. Point size is on the Style panel only: millimetres for a journal (`style["marker_mm"]`), pixels for App (`style["symbol_size"]`, default 6). Changing the journal resets the spin to that journal's `marker_mm`. `marker_size_px` is what both the draw and the resize restyle use.
 
-| Journal | Font | Text | Line | Columns |
-|---------|------|------|------|---------|
-| PRL | Times New Roman | 9 pt (APS lettering ≥ 2 mm) | 0.5 pt | 3.375 in; 2-col **7.0 in DERIVED** (REVTeX text width) |
-| Nature | Arial | 7 pt | 0.75 pt | 89 mm, 130 mm (1.5), 183 mm |
-| Optica | Arial | 8 pt | 0.75 pt | 8.3 cm; 2-col **17.1 cm DERIVED** |
+| Journal | Font | Text | Curve | Axis / ticks | Marker | Columns |
+|---------|------|------|-------|--------------|--------|---------|
+| PRL | Times New Roman | 9 pt (APS lettering ≥ 2 mm) | 1.0 pt | 0.75 pt frame, 4 pt ticks | 2.2 mm (≥ 2 mm) | 3.375 in; 2-col **7.0 in DERIVED** (REVTeX text width) |
+| Nature | Arial | 7 pt (allowed 5–7) | 0.75 pt | 0.5 pt frame, 2.5 pt ticks | 1.8 mm | 89 mm, 130 mm (1.5), 183 mm |
+| Optica | Arial | 8 pt | 1.0 pt | 0.75 pt frame, 3.5 pt ticks | 2.0 mm | 8.3 cm; 2-col **17.1 cm DERIVED** |
 
-`App` stays the dark theme. On screen the dock still fills the window; `journal_paint_px` scales fonts, line width, and 1 mm markers so a 600 dpi export lands on those physical sizes. Do not store journal line width as raw pixels.
+`App` stays the dark theme. On screen the dock still fills the window; `journal_paint_px` scales fonts, the frame, curves, and markers from the **view widget** width (not a stale `PlotItem.width()`), so a resize and a 600 dpi export land on those physical sizes. Journal ticks are major-only and point **inward** (`tickLength` negative); the frame and tick pens are non-cosmetic `FlatCap` (a round cap reads as a second tick). Curve and error-bar pens stay cosmetic on screen; Save figure boosts them by the export scale. Do not store journal line width as raw pixels. `AxisItem.setStyle` requires `tickLength` and `tickTextOffset` to be Python `int`.
 
 Blank X/Y label keeps the automatic title (`_set_plot_label`). A typed label calls `enableAutoSIPrefix(False)`.
 
@@ -236,7 +236,9 @@ Blank X/Y label keeps the automatic title (`_set_plot_label`). A typed label cal
 
 - **Export**: binned curve → Export dock + TSV; copies style, axis labels, and fit prefs. Still means "snapshot", not a file.
 - **Copy ▾**: image (Ctrl+C) / raw data (Ctrl+A) / **Save figure…**.
+- **Copy image** (`_copy_plot_image`) writes the **plot** through the same `ImageExporter` width as Save figure, then puts that image on the clipboard. It does not grab the dock page (that included the Encoding sidebar).
 - **Save figure…** (`save_figure` → `_write_figure`): PNG and LZW TIFF at column width × 600 dpi (`ImageExporter`); SVG (pyqtgraph, then Qt `QSvgGenerator` if that exporter throws); PDF via `QPdfWriter` + `widget.render`. App style uses the widget's pixel size, not a journal column.
+- The legend ignores the export transform. `_boost_export_strokes` grows label px and the sample cell by `export_px / widget_px`, then `updateSize()`, so the rows do not pile up. `_place_legend_for_export` then puts the corner back: position is scaled by the exporter, the legend body is not, so subtracting the boosted width from the on-screen view box slides a bottom/right legend into the data. On-screen position is restored when the export undo runs.
 
 ### Legacy recipe-only paths (no main UI)
 
@@ -282,7 +284,7 @@ Browser bottom: list `experiments/*.zip`; Save / Load / Refresh; double-click lo
 
 - Scans fully embedded (portable). `scan_sel_names` is the full membership at save time.
 - Save drops recipes whose `scan_name` / `scan_sel_names` no longer match `self.scans`, and stamps each remaining recipe with that dock's `style`, `xlabel`, and `ylabel`.
-- Recipes replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch`). Old `derived_merge` / `derived_global` recipes are skipped.
+- Recipes replayed by `_replay_tab_recipe` (`export` / `2d` / `heatmap` / `batch` / `derive`). A `derive` tab is rebuilt by `_replay_derive_recipe`: refit from `source_encoding`, `fitfunc`, `param`, and `x_dim` (points are not stored in the zip). `average` is skipped (the reduced cube is not in the zip). Old `derived_merge` / `derived_global` recipes are skipped.
 - v1 zips still load (no `dock_layout`).
 - Closing an analysis dock drops its recipe from `self.tab_recipes`.
 
@@ -340,8 +342,10 @@ Secondary plots = pyqtgraph in `PlotDock`s only.
 | `draw_plot` / `_redraw_universal_dock` / `_redraw_derived_dock` | Rendering |
 | `import_data` / `ScanPickerDialog` / `discover_scan_dirs` | Append scans; directory list cached until the picker's Refresh |
 | `_delete_loaded_scans` / `refresh_all_plots` / `refresh_plot_dock` | Membership edit and manual plot sync |
-| `JOURNAL_SPECS` / `journal_paint_px` / `_set_plot_label` | Journal figure geometry and axis-label override |
-| `save_figure` / `_write_figure` | PNG, TIFF, SVG, PDF |
+| `JOURNAL_SPECS` / `journal_paint_px` / `marker_size_px` / `_set_plot_label` | Journal figure geometry, point size, axis-label override |
+| `save_figure` / `_write_figure` / `_copy_plot_image` | PNG, TIFF, SVG, PDF; Copy image uses the same raster |
+| `_boost_export_strokes` / `_place_legend_for_export` | Export line width, legend row height, and corner anchor |
+| `_replay_derive_recipe` | Restore a Fit-param dock from a saved `derive` recipe |
 | `get_survival_rate` / `get_errorbars` / `_roi_data_totals` | Binned Y and which ROIs have data |
 | `_batch_plot_items` | One legend layout + one auto-range per Curves redraw |
 | `save_experiment` / `open_experiment` | Experiment zip I/O (v2); Load confirms if membership is dirty |
@@ -353,7 +357,7 @@ Secondary plots = pyqtgraph in `PlotDock`s only.
 
 Only do these if the user asks:
 
-1. Embed Derive/Average docks fully in experiment zip (points + reduced cubes).
+1. Embed Average docks in the experiment zip. Fit-param docks already reload by refitting (`derive` recipe); the points themselves are still not stored.
 2. Promote derived → Loaded scans (explicit action).
 3. Full encoding shelf (explicit Color/Y channels).
 4. Import dialog virtualization. Cache and filter debounce are in place; the **first** Import of ~10k folders is still a UI-thread walk (~2 s). A virtual list only matters if that first fill or scrolling the full list becomes the problem.
@@ -366,7 +370,7 @@ Only do these if the user asks:
 ## Verification habits
 
 1. Restart GUI after edits.
-2. Smoke: Import → Refresh → Encoding XY Fit/Style → Journal + axis label → Type 2D → Type ROI grid → Fit param… → Average… (incl. on Fit plot) → nested Average → Export → Save figure → Delete a scan → Refresh → Clear data → Load exp (confirm if dirty).
+2. Smoke: Import → Refresh → Encoding XY Fit/Style → Journal + Point size + axis label → Type 2D → Type ROI grid → Fit param… (one legend entry per ROI) → Average… (incl. on Fit plot) → nested Average → Export → Copy image (plot only) → Save figure (legend stays in its corner) → Delete a scan → Refresh → Clear data → Load exp (confirm if dirty; a `derive` tab comes back).
 3. Watch `TypeError: takes N positional arguments but M were given` on new button slots.
 4. Prefer `logging` with scan name + ROI; status bar for user-facing results.
 5. Run `_smoke_test_universal.py` offscreen after Derive/Average/Encoding, Loaded-scans, or figure-export changes. It also times Import cache (second open must not walk) and `create_new_plot` on every scan under `data/2026-10-10` and `data/2026-10-11` (one `draw_plot`). Wilson values must stay identical to a single `proportion_confint(..., method="wilson")` per bin. Later cases check journal column widths, that Delete does not call `draw_plot`, axis-label overrides, a PNG write, and that Load with a dirty list can be cancelled.
