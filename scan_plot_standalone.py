@@ -3442,11 +3442,28 @@ class ScanPlotApplet(QMainWindow, Ui_MainWindow):
             x, y = scan.plots.get_data(slice_index, roi)
             if not scan.metadata["key_sets"]:
                 x = np.arange(len(y))
-            series.append((
-                f"ROI{roi}",
-                np.asarray(x, dtype=float).ravel(),
-                np.asarray(y, dtype=float).ravel(),
-            ))
+            # Survival Y is (n, 2) attempts/successes. The plot shows the binned
+            # rate; ravel() doubled the column and then min(len(x), len(y))
+            # kept a truncated mix of the two counts.
+            fn = (scan.metadata.get("function") or "")
+            y_arr = np.asarray(y)
+            if "survival" in fn.lower() or (y_arr.ndim == 2 and y_arr.shape[-1] >= 2):
+                binned = self._binned_curve(scan, x, y)
+                if binned is None:
+                    continue
+                ux, means, heights, _centers = binned
+                series.append((
+                    f"ROI{roi}",
+                    np.asarray(ux, dtype=float).ravel(),
+                    np.asarray(means, dtype=float).ravel(),
+                    np.asarray(heights, dtype=float).ravel() / 2.0,
+                ))
+            else:
+                series.append((
+                    f"ROI{roi}",
+                    np.asarray(x, dtype=float).ravel(),
+                    np.asarray(y, dtype=float).ravel(),
+                ))
         if not series:
             raise ValueError("empty derived scan")
         self._copy_named_xy_series(series)
